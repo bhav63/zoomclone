@@ -13,34 +13,47 @@ export default function Home() {
   const [schedTime, setSchedTime] = useState("");
   const [joinRoom, setJoinRoom] = useState("");
   const [joinPass, setJoinPass] = useState("");
+  const [joinLink, setJoinLink] = useState("");
   const [lastRoomLink, setLastRoomLink] = useState("");
 
-  const BASE_URL = "https://zoomclone.vercel.app"; // ✅ Fixed hardcoded base URL
+  const BASE_URL = process.env.REACT_APP_PUBLIC_URL || "https://zoomclone-v3.vercel.app";
 
   useEffect(() => {
-    (async () => {
-      const { data: { user }, error } = await supabase.auth.getUser();
-      if (error || !user) return nav("/login");
-      setUser(user);
-      loadMeetings(user.id);
-    })();
+    const fetchUserAndMeetings = async () => {
+      const { data, error } = await supabase.auth.getUser();
+      if (error || !data?.user) {
+        nav("/login");
+        return;
+      }
+      setUser(data.user);
+      loadMeetings(data.user.id);
+    };
+
+    fetchUserAndMeetings();
   }, [nav]);
 
-  async function loadMeetings(userId) {
+  const loadMeetings = async (userId) => {
     const { data, error } = await supabase
       .from("meetings")
       .select("*")
       .eq("creator_id", userId)
       .order("scheduled_start", { ascending: true });
-    if (!error) setMeetings(data);
-  }
 
-  function randomRoom() {
-    return crypto.randomUUID().slice(0, 8);
-  }
+    if (!error && data) {
+      const now = new Date();
+      const upcoming = data.filter(
+        (m) =>
+          m.scheduled_start && new Date(m.scheduled_start) > now
+      );
+      setMeetings(upcoming);
+    }
+  };
 
-  async function createInstant() {
+  const randomRoom = () => crypto.randomUUID().slice(0, 8);
+
+  const createInstant = async () => {
     const room = randomRoom();
+
     const { data, error } = await supabase
       .from("meetings")
       .insert({
@@ -60,27 +73,25 @@ export default function Home() {
     const link = `${BASE_URL}/room/${room}${instPass ? `?passcode=${encodeURIComponent(instPass)}` : ""}`;
     setLastRoomLink(link);
     nav(`/room/${room}${instPass ? `?passcode=${encodeURIComponent(instPass)}` : ""}`);
-  }
+  };
 
-  async function scheduleMeeting() {
+  const scheduleMeeting = async () => {
     const room = schedRoom || randomRoom();
+
     if (!schedTitle || !schedTime) {
       return alert("Title and scheduled date/time are required.");
     }
 
-    const { data, error } = await supabase
-      .from("meetings")
-      .insert({
-        room_id: room,
-        title: schedTitle,
-        creator_id: user.id,
-        passcode: schedPass || null,
-        scheduled_start: schedTime,
-      })
-      .single();
+    const { error } = await supabase.from("meetings").insert({
+      room_id: room,
+      title: schedTitle,
+      creator_id: user.id,
+      passcode: schedPass || null,
+      scheduled_start: schedTime,
+    });
 
-    if (error || !data) {
-      return alert("Error scheduling meeting: " + (error?.message || ""));
+    if (error) {
+      return alert("Error scheduling meeting: " + error.message);
     }
 
     alert("Meeting scheduled!");
@@ -89,18 +100,35 @@ export default function Home() {
     setSchedPass("");
     setSchedTime("");
     loadMeetings(user.id);
-  }
+  };
 
-  function join() {
-    if (!joinRoom) return alert("Room ID required");
+  const join = () => {
+    if (!joinRoom) return alert("Room ID is required.");
     const path = `/room/${joinRoom}${joinPass ? `?passcode=${encodeURIComponent(joinPass)}` : ""}`;
     nav(path);
-  }
+  };
+
+  const joinByLink = () => {
+    try {
+      const url = new URL(joinLink);
+      const pathname = url.pathname;
+      const passcode = url.searchParams.get("passcode");
+      const parts = pathname.split("/");
+      const roomId = parts[2];
+      if (!roomId) throw new Error("Room ID not found in link.");
+
+      const path = `/room/${roomId}${passcode ? `?passcode=${encodeURIComponent(passcode)}` : ""}`;
+      nav(path);
+    } catch (err) {
+      alert("Invalid meeting link.");
+    }
+  };
 
   return (
     <div style={{ padding: "2rem", maxWidth: 600, margin: "auto" }}>
       <h1>📹 MT Video App</h1>
 
+      {/* Instant Meeting */}
       <section>
         <h2>Instant Meeting</h2>
         <input
@@ -119,6 +147,7 @@ export default function Home() {
         )}
       </section>
 
+      {/* Schedule Meeting */}
       <section style={{ marginTop: 30 }}>
         <h2>Schedule Meeting</h2>
         <input
@@ -144,6 +173,7 @@ export default function Home() {
         <button onClick={scheduleMeeting}>Schedule Meeting</button>
       </section>
 
+      {/* Join Meeting */}
       <section style={{ marginTop: 30 }}>
         <h2>Join Meeting</h2>
         <input
@@ -157,41 +187,51 @@ export default function Home() {
           onChange={(e) => setJoinPass(e.target.value)}
         />
         <button onClick={join}>Join</button>
+
+        <hr style={{ margin: "1rem 0" }} />
+
+        <input
+          placeholder="Or paste full meeting link"
+          value={joinLink}
+          onChange={(e) => setJoinLink(e.target.value)}
+        />
+        <button onClick={joinByLink}>Join via Link</button>
       </section>
 
+      {/* Upcoming Scheduled Meetings */}
       <section style={{ marginTop: 30 }}>
-        <h2>Your Meetings</h2>
-        <ul>
-          {meetings.map((m) => {
-            const fullLink = `${BASE_URL}/room/${m.room_id}${m.passcode ? `?passcode=${encodeURIComponent(m.passcode)}` : ""}`;
-            return (
-              <li key={m.id} style={{ marginBottom: 12 }}>
-                <strong>{m.title}</strong>{" "}
-                {m.scheduled_start
-                  ? `– ${new Date(m.scheduled_start).toLocaleString()}`
-                  : "(Instant)"}
-                <br />
-                Room: {m.room_id}{" "}
-                <button
-                  onClick={() =>
-                    nav(`/room/${m.room_id}${m.passcode ? `?passcode=${encodeURIComponent(m.passcode)}` : ""}`)
-                  }
-                >
-                  Join
-                </button>
-                <br />
-                Link:{" "}
-                <a
-                  href={fullLink}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  {fullLink}
-                </a>
-              </li>
-            );
-          })}
-        </ul>
+        <h2>Upcoming Scheduled Meetings</h2>
+        {meetings.length === 0 ? (
+          <p>No upcoming meetings.</p>
+        ) : (
+          <ul>
+            {meetings.map((m) => {
+              const fullLink = `${BASE_URL}/room/${m.room_id}${
+                m.passcode ? `?passcode=${encodeURIComponent(m.passcode)}` : ""
+              }`;
+              return (
+                <li key={m.id} style={{ marginBottom: 12 }}>
+                  <strong>{m.title}</strong>{" "}
+                  – {new Date(m.scheduled_start).toLocaleString()}
+                  <br />
+                  Room: {m.room_id}{" "}
+                  <button
+                    onClick={() =>
+                      nav(`/room/${m.room_id}${m.passcode ? `?passcode=${encodeURIComponent(m.passcode)}` : ""}`)
+                    }
+                  >
+                    Join
+                  </button>
+                  <br />
+                  Link:{" "}
+                  <a href={fullLink} target="_blank" rel="noopener noreferrer">
+                    {fullLink}
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </section>
     </div>
   );

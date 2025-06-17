@@ -1,4 +1,3 @@
-// src/components/MeetingRoom.jsx
 import React, { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import Peer from "peerjs";
@@ -44,6 +43,7 @@ export default function MeetingRoom() {
     const {
       data: { user },
     } = await supabase.auth.getUser();
+
     if (!user) return navigate("/");
 
     const { data: meeting } = await supabase
@@ -51,6 +51,7 @@ export default function MeetingRoom() {
       .select("*")
       .eq("room_id", roomId)
       .maybeSingle();
+
     if (!meeting) return navigate("/");
 
     setMeetingDbId(meeting.id);
@@ -117,7 +118,6 @@ export default function MeetingRoom() {
       data: { user },
     } = await supabase.auth.getUser();
 
-    // 🔒 Wait until local video ref is ready
     if (!localVideoRef.current) {
       await new Promise((resolve) => {
         const interval = setInterval(() => {
@@ -129,7 +129,6 @@ export default function MeetingRoom() {
       });
     }
 
-    // ✅ Continue after ref is available
     const stream = await navigator.mediaDevices.getUserMedia({
       video: true,
       audio: true,
@@ -142,6 +141,7 @@ export default function MeetingRoom() {
 
     peer.on("open", async (id) => {
       await supabase.from("signals").insert({ room_id: roomId, peer_id: id });
+
       const { data: others } = await supabase
         .from("signals")
         .select("*")
@@ -195,9 +195,7 @@ export default function MeetingRoom() {
           table: "messages",
           filter: `room_id=eq.${roomId}`,
         },
-        (p) => {
-          setMessages((prev) => [...prev, p.new]);
-        }
+        (p) => setMessages((prev) => [...prev, p.new])
       )
       .subscribe();
 
@@ -214,7 +212,9 @@ export default function MeetingRoom() {
         (payload) => {
           setReactions((prev) => [...prev, payload.new]);
           setTimeout(() => {
-            setReactions((prev) => prev.filter((r) => r.id !== payload.new.id));
+            setReactions((prev) =>
+              prev.filter((r) => r.id !== payload.new.id)
+            );
           }, 3000);
         }
       )
@@ -300,7 +300,7 @@ export default function MeetingRoom() {
         }
         localVideoRef.current.srcObject = localStreamRef.current;
       };
-    } catch (e) {
+    } catch {
       alert("Screen share failed.");
     }
   };
@@ -323,15 +323,14 @@ export default function MeetingRoom() {
 
   const stopRecording = async () => {
     if (!recorderRef.current) return;
-
     await recorderRef.current.stopRecording(async () => {
       const blob = recorderRef.current.getBlob();
       const filename = `rec-${roomId}-${Date.now()}.webm`;
 
-      const { data, error: upError } = await supabase.storage
+      const { data, error } = await supabase.storage
         .from("recordings")
         .upload(filename, blob, { contentType: "video/webm" });
-      if (upError) return alert("Upload failed.");
+      if (error) return alert("Upload failed.");
 
       await supabase.from("recordings").insert({
         room_id: roomId,
@@ -378,8 +377,7 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
-    setMessages((prev) => [...prev, newMsg]); // Optimistic UI
-
+    setMessages((prev) => [...prev, newMsg]);
     await supabase.from("messages").insert(newMsg);
     setChatInput("");
   };
@@ -394,10 +392,9 @@ export default function MeetingRoom() {
       room_id: roomId,
       user_id: user.id,
       emoji,
-      created_at: new Date().toISOString(), // optional: just for local state
+      created_at: new Date().toISOString(),
     };
 
-    // Optimistic UI update
     setReactions((prev) => [...prev, newReaction]);
     setTimeout(() => {
       setReactions((prev) => prev.filter((r) => r !== newReaction));
@@ -412,30 +409,30 @@ export default function MeetingRoom() {
       <p>Passcode: {passcodeRequired ? "Yes" : "No"}</p>
       <p>Host: {isHost ? "Yes" : "No"}</p>
       <p>Participants: {participants.length}</p>
-      <div className="my-2">
-  <label className="font-semibold">Share this meeting link:</label>
-  <div className="flex items-center gap-2 mt-1">
-    <input
-      type="text"
-      readOnly
-      className="border p-2 rounded w-full"
-      value={`https://zoomclone.vercel.app/room/${roomId}`}
-      onClick={(e) => e.target.select()}
-    />
-    <button
-      className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
-      onClick={() => {
-        navigator.clipboard.writeText(
-          `https://zoomclone.vercel.app/room/${roomId}`
-        );
-        alert("Meeting link copied to clipboard!");
-      }}
-    >
-      Copy
-    </button>
-  </div>
-</div>
 
+      <div className="my-2">
+        <label className="font-semibold">Share this meeting link:</label>
+        <div className="flex items-center gap-2 mt-1">
+          <input
+            type="text"
+            readOnly
+            className="border p-2 rounded w-full"
+            value={`https://zoomclone-v3.vercel.app/room/${roomId}`}
+            onClick={(e) => e.target.select()}
+          />
+          <button
+            className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
+            onClick={() => {
+              navigator.clipboard.writeText(
+                `https://zoomclone-v3.vercel.app/room/${roomId}`
+              );
+              alert("Meeting link copied to clipboard!");
+            }}
+          >
+            Copy
+          </button>
+        </div>
+      </div>
 
       {isHost && waitingList.length > 0 && (
         <div className="bg-yellow-100 p-2">
@@ -476,7 +473,7 @@ export default function MeetingRoom() {
       <div className="mt-4">
         <div className="h-40 overflow-y-auto border p-2">
           {messages.map((m) => (
-            <div key={m.id}>
+            <div key={m.id || m.created_at}>
               <strong>{m.sender}:</strong> {m.text}
             </div>
           ))}

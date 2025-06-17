@@ -8,13 +8,28 @@ export default function ProtectedRoute({ children }) {
   const [user, setUser] = useState(null);
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setUser(data.user);
+    const checkUser = async () => {
+      const { data, error } = await supabase.auth.getUser();
+      if (!error) {
+        setUser(data.user);
+      }
+      setAuthChecked(true);
+    };
+
+    checkUser();
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
       setAuthChecked(true);
     });
+
+    return () => {
+      authListener.subscription?.unsubscribe();
+    };
   }, []);
 
   if (!authChecked) return <div>Loading...</div>;
 
-  return user ? children : <Navigate to="/" replace />;
+  // 🔁 Redirect to "/login" instead of "/"
+  return user ? children : <Navigate to="/login" replace />;
 }
