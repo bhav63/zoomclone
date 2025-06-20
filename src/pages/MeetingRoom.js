@@ -13,39 +13,43 @@ export default function MeetingRoom() {
   const [waitingList, setWaitingList] = useState([]);
   const [participants, setParticipants] = useState([]);
   const [messages, setMessages] = useState([]);
-  const [chatInput, setChatInput] = useState("");
   const [reactions, setReactions] = useState([]);
+  const [chatInput, setChatInput] = useState("");
   const [isMuted, setIsMuted] = useState(false);
   const [cameraOn, setCameraOn] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
   const [meetingDbId, setMeetingDbId] = useState(null);
   const [passcodeRequired, setPasscodeRequired] = useState(false);
 
-  const localVideoRef = useRef(null);
+  const localVideoRef = useRef();
   const remoteVideosRef = useRef({});
-  const localStreamRef = useRef(null);
-  const peerRef = useRef(null);
-  const recorderRef = useRef(null);
+  const localStreamRef = useRef();
+  const peerRef = useRef();
+  const recorderRef = useRef();
 
-  const signalsChannel = useRef(null);
-  const messagesChannel = useRef(null);
-  const reactionsChannel = useRef(null);
-  const participantsChannel = useRef(null);
-  const waitingChannel = useRef(null);
+  const signalsChannel = useRef();
+  const participantsChannel = useRef();
+  const waitingChannel = useRef();
+  const refreshInterval = useRef();
+
+  const BASE_URL = "https://zoomclone-v3.vercel.app";
+  const shareLink = `${BASE_URL}/room/${roomId}${
+    passcodeRequired
+      ? `?passcode=${new URLSearchParams(search).get("passcode")}`
+      : ""
+  }`;
 
   useEffect(() => {
     initRoom();
     return () => leaveRoom();
-    // eslint-disable-next-line
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function initRoom() {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    if (userErr || !userData.user) return navigate("/login");
 
-    if (!user) return navigate("/");
-
+    const user = userData.user;
     const { data: meeting } = await supabase
       .from("meetings")
       .select("*")
@@ -55,80 +59,129 @@ export default function MeetingRoom() {
     if (!meeting) return navigate("/");
 
     setMeetingDbId(meeting.id);
-    const host = user.id === meeting.creator_id;
-    setIsHost(host);
+    setIsHost(user.id === meeting.creator_id);
     setPasscodeRequired(!!meeting.passcode);
 
-    const passFromUrl = new URLSearchParams(search).get("passcode") || "";
-    if (meeting.passcode && passFromUrl !== meeting.passcode) {
+    const providedPass = new URLSearchParams(search).get("passcode");
+    if (meeting.passcode && providedPass !== meeting.passcode) {
       const attempt = prompt("Enter passcode:");
       if (attempt !== meeting.passcode) return navigate("/");
     }
 
-    if (!host) {
-      await supabase
-        .from("waiting_room")
-        .insert({ room_id: roomId, user_id: user.id, email: user.email });
-      alert("Waiting for approval...");
+    if (user.id === meeting.creator_id) {
+      await joinMeeting(meeting.id, user.id);
+      setupWaitingListener(meeting.id);
+      return;
     }
 
-    await joinMeeting(meeting.id);
-    if (host) listenWaitingRoom();
+    // Guest flow: check or create participant entry
+    const { data: participantEntry } = await supabase
+      .from("participants")
+      .select("status")
+      .eq("meeting_id", meeting.id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (!participantEntry) {
+      await supabase.from("participants").insert({
+        meeting_id: meeting.id,
+        user_id: user.id,
+        status: "pending",
+      });
+      alert("✅ Waiting for host approval...");
+      setupParticipantListener(meeting.id, user.id);
+      return;
+    }
+
+    const { status } = participantEntry;
+    if (status === "pending") {
+      alert("✅ Still waiting for host approval...");
+      setupParticipantListener(meeting.id, user.id);
+      return;
+    }
+    if (status === "denied") {
+      alert("⛔ You have been denied entry by host.");
+      return navigate("/");
+    }
+    if (status === "approved") {
+      await joinMeeting(meeting.id, user.id);
+    }
   }
 
-  function listenWaitingRoom() {
-    if (waitingChannel.current) return;
+  function setupWaitingListener(meetingId) {
+    updateWaitingList(meetingId);
     waitingChannel.current = supabase
-      .channel(`waiting:${roomId}`)
+      .channel(`waiting:${meetingId}`)
       .on(
         "postgres_changes",
         {
-          event: "INSERT",
+          event: "*",
           schema: "public",
-          table: "waiting_room",
-          filter: `room_id=eq.${roomId}`,
+          table: "participants",
+          filter: `meeting_id=eq.${meetingId}`,
         },
-        fetchWaiting
+        () => updateWaitingList(meetingId)
       )
       .subscribe();
-    fetchWaiting();
   }
 
-  async function fetchWaiting() {
-    const { data } = await supabase
-      .from("waiting_room")
-      .select("*")
-      .eq("room_id", roomId);
+  async function updateWaitingList(meetingId) {
+    const { data, error } = await supabase
+      .from("participants")
+      .select("user_id, users(email)")
+      .eq("meeting_id", meetingId)
+      .eq("status", "pending")
+      .order("created_at", { ascending: true });
+    if (error) console.error(error);
     setWaitingList(data || []);
+  }
+
+  function setupParticipantListener(meetingId, userId) {
+    participantsChannel.current = supabase
+      .channel(`participants:you:${meetingId}:${userId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${meetingId},user_id=eq.${userId}`,
+        },
+        payload => {
+          const newStatus = payload.new.status;
+          if (newStatus === "approved") joinMeeting(meetingId, userId);
+          if (newStatus === "denied") {
+            alert("⛔ Your request was denied.");
+            navigate("/");
+          }
+        }
+      )
+      .subscribe();
   }
 
   async function approveUser(user_id) {
     await supabase
-      .from("waiting_room")
-      .delete()
-      .eq("room_id", roomId)
-      .eq("user_id", user_id);
-    await supabase
       .from("participants")
-      .insert({ meeting_id: meetingDbId, user_id });
+      .update({ status: "approved" })
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", user_id);
+    updateWaitingList(meetingDbId);
   }
 
-  async function joinMeeting(meetingId) {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+  async function denyUser(user_id) {
+    await supabase
+      .from("participants")
+      .update({ status: "denied" })
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", user_id);
+    updateWaitingList(meetingDbId);
+  }
 
-    if (!localVideoRef.current) {
-      await new Promise((resolve) => {
-        const interval = setInterval(() => {
-          if (localVideoRef.current) {
-            clearInterval(interval);
-            resolve();
-          }
-        }, 50);
-      });
-    }
+  async function joinMeeting(meetingId, userId) {
+    // fetch approved participants for UI
+    updateParticipants(meetingId);
 
+    // start media
     const stream = await navigator.mediaDevices.getUserMedia({
       video: true,
       audio: true,
@@ -139,19 +192,16 @@ export default function MeetingRoom() {
     const peer = new Peer();
     peerRef.current = peer;
 
-    peer.on("open", async (id) => {
-      await supabase.from("signals").insert({ room_id: roomId, peer_id: id });
+    peer.on("open", async peerId => {
+      await supabase.from("signals").insert({ room_id: roomId, peer_id: peerId });
 
       const { data: others } = await supabase
         .from("signals")
         .select("*")
         .eq("room_id", roomId)
-        .neq("peer_id", id);
+        .neq("peer_id", peerId);
 
-      others.forEach((o) => {
-        const call = peer.call(o.peer_id, stream);
-        call.on("stream", (s) => addRemote(o.peer_id, s));
-      });
+      others.forEach(o => setupCall(peer.call(o.peer_id, stream), o.peer_id));
 
       signalsChannel.current = supabase
         .channel(`signals:${roomId}`)
@@ -163,29 +213,28 @@ export default function MeetingRoom() {
             table: "signals",
             filter: `room_id=eq.${roomId}`,
           },
-          (p) => {
-            if (p.new.peer_id !== id) {
-              const call = peer.call(p.new.peer_id, stream);
-              call.on("stream", (s) => addRemote(p.new.peer_id, s));
-            }
+          payload => {
+            if (payload.new.peer_id !== peerId)
+              setupCall(peer.call(payload.new.peer_id, stream), payload.new.peer_id);
           }
         )
         .subscribe();
     });
 
-    peer.on("call", (c) => {
-      c.answer(localStreamRef.current);
-      c.on("stream", (s) => addRemote(c.peer, s));
+    peer.on("call", call => {
+      call.answer(stream);
+      setupCall(call, call.peer);
     });
 
+    // messages
     const { data: oldMsgs } = await supabase
       .from("messages")
       .select("*")
       .eq("room_id", roomId)
-      .order("created_at");
+      .order("created_at", { ascending: true });
     setMessages(oldMsgs || []);
 
-    messagesChannel.current = supabase
+    supabase
       .channel(`messages:${roomId}`)
       .on(
         "postgres_changes",
@@ -195,11 +244,12 @@ export default function MeetingRoom() {
           table: "messages",
           filter: `room_id=eq.${roomId}`,
         },
-        (p) => setMessages((prev) => [...prev, p.new])
+        payload => setMessages(m => [...m, payload.new])
       )
       .subscribe();
 
-    reactionsChannel.current = supabase
+    // reactions
+    supabase
       .channel(`reactions:${roomId}`)
       .on(
         "postgres_changes",
@@ -209,242 +259,207 @@ export default function MeetingRoom() {
           table: "reactions",
           filter: `room_id=eq.${roomId}`,
         },
-        (payload) => {
-          setReactions((prev) => [...prev, payload.new]);
-          setTimeout(() => {
-            setReactions((prev) =>
-              prev.filter((r) => r.id !== payload.new.id)
-            );
-          }, 3000);
+        payload => {
+          setReactions(r => [...r, payload.new]);
+          setTimeout(
+            () => setReactions(r => r.filter(x => x.id !== payload.new.id)),
+            10000
+          );
         }
       )
       .subscribe();
 
-    const { data: parts } = await supabase
+    refreshInterval.current = setInterval(iceRestart, 5000);
+  }
+
+  async function updateParticipants(meetingId) {
+    const { data } = await supabase
       .from("participants")
       .select("user_id")
-      .eq("meeting_id", meetingId);
-    setParticipants(parts.map((p) => p.user_id));
+      .eq("meeting_id", meetingId)
+      .eq("status", "approved");
+    setParticipants(data.map(p => p.user_id));
+  }
 
-    participantsChannel.current = supabase
-      .channel(`participants:${roomId}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "participants" },
-        async () => {
-          const { data: up } = await supabase
-            .from("participants")
-            .select("user_id")
-            .eq("meeting_id", meetingId);
-          setParticipants(up.map((p) => p.user_id));
-        }
-      )
-      .subscribe();
+  function setupCall(call, peerId) {
+    call.on("stream", stream => addRemote(peerId, stream));
+    call.on("close", () => removeRemote(peerId));
+    call.on("error", () => removeRemote(peerId));
   }
 
   function addRemote(id, stream) {
     if (remoteVideosRef.current[id]) return;
     const container = document.createElement("div");
-    const v = document.createElement("video");
-    v.srcObject = stream;
-    v.autoplay = v.playsInline = true;
-    v.width = 160;
-    container.append(v);
+    const video = document.createElement("video");
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.playsInline = true;
+    container.appendChild(video);
     remoteVideosRef.current[id] = container;
-    document.getElementById("remote-videos")?.append(container);
+    document.getElementById("remote-videos")?.appendChild(container);
   }
 
-  const toggleMute = () => {
-    const t = localStreamRef.current.getAudioTracks()[0];
-    t.enabled = !t.enabled;
-    setIsMuted(!t.enabled);
-  };
+  function removeRemote(id) {
+    const el = remoteVideosRef.current[id];
+    if (el) el.remove();
+    delete remoteVideosRef.current[id];
+  }
 
-  const toggleCam = async () => {
-    if (cameraOn) {
-      localStreamRef.current.getVideoTracks().forEach((t) => t.stop());
-      localVideoRef.current.srcObject = null;
-    } else {
-      const s = await navigator.mediaDevices.getUserMedia({ video: true });
-      localStreamRef.current.addTrack(s.getVideoTracks()[0]);
-      localVideoRef.current.srcObject = localStreamRef.current;
-    }
-    setCameraOn(!cameraOn);
-  };
+  function iceRestart() {
+    Object.values(peerRef.current.connections || {}).flat().forEach(conn => {
+      conn.peerConnection.restartIce?.();
+    });
+  }
 
-  const shareScreen = async () => {
+  function toggleMute() {
+    const t = localStreamRef.current?.getAudioTracks()[0];
+    if (t) { t.enabled = !t.enabled; setIsMuted(!t.enabled); }
+  }
+
+  function toggleCam() {
+    const t = localStreamRef.current?.getVideoTracks()[0];
+    if (t) { t.enabled = !t.enabled; setCameraOn(t.enabled); }
+  }
+
+  async function shareScreen() {
     try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-      });
-      const screenTrack = screenStream.getVideoTracks()[0];
-
-      for (const connArray of Object.values(peerRef.current.connections)) {
-        connArray.forEach((conn) => {
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const track = display.getVideoTracks()[0];
+      Object.values(peerRef.current.connections || {})
+        .flat()
+        .forEach(conn => {
           const sender = conn.peerConnection
             .getSenders()
-            .find((s) => s.track.kind === "video");
-          sender?.replaceTrack(screenTrack);
+            .find(s => s.track.kind === "video");
+          sender?.replaceTrack(track);
         });
-      }
-
-      screenTrack.onended = () => {
-        const camTrack = localStreamRef.current.getVideoTracks()[0];
-        for (const connArray of Object.values(peerRef.current.connections)) {
-          connArray.forEach((conn) => {
-            const sender = conn.peerConnection
-              .getSenders()
-              .find((s) => s.track.kind === "video");
-            sender?.replaceTrack(camTrack);
-          });
-        }
-        localVideoRef.current.srcObject = localStreamRef.current;
-      };
+      track.onended = toggleCam;
     } catch {
-      alert("Screen share failed.");
+      alert("Screen sharing failed.");
     }
-  };
+  }
 
-  const startRecording = () => {
+  function startRecording() {
     const mix = new MediaStream();
-    localStreamRef.current.getTracks().forEach((t) => mix.addTrack(t));
-    Object.values(remoteVideosRef.current).forEach((dom) => {
-      dom
-        .querySelector("video")
-        ?.srcObject?.getTracks()
-        .forEach((t) => mix.addTrack(t));
-    });
-
-    const recorder = RecordRTC(mix, { mimeType: "video/webm" });
-    recorder.startRecording();
-    recorderRef.current = recorder;
+    localStreamRef.current.getTracks().forEach(t => mix.addTrack(t));
+    Object.values(remoteVideosRef.current)
+      .map(el => el.querySelector("video"))
+      .forEach(v => v?.srcObject.getTracks().forEach(t => mix.addTrack(t)));
+    const rec = RecordRTC(mix, { mimeType: "video/webm" });
+    rec.startRecording();
+    recorderRef.current = rec;
     setIsRecording(true);
-  };
+  }
 
-  const stopRecording = async () => {
-    if (!recorderRef.current) return;
-    await recorderRef.current.stopRecording(async () => {
-      const blob = recorderRef.current.getBlob();
-      const filename = `rec-${roomId}-${Date.now()}.webm`;
-
-      const { data, error } = await supabase.storage
-        .from("recordings")
-        .upload(filename, blob, { contentType: "video/webm" });
-      if (error) return alert("Upload failed.");
-
-      await supabase.from("recordings").insert({
-        room_id: roomId,
-        uploaded_by: (await supabase.auth.getUser()).data.user.email,
-        file_name: filename,
-        file_url: `${process.env.REACT_APP_SUPABASE_URL}/storage/v1/object/public/${data.path}`,
-      });
-
-      alert("Recording saved!");
+  async function stopRecording() {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    await rec.stopRecording();
+    const blob = rec.getBlob();
+    const filename = `rec-${roomId}-${Date.now()}.webm`;
+    const { data, error } = await supabase.storage
+      .from("recordings")
+      .upload(filename, blob);
+    if (error) return alert("Upload failed.");
+    const { data: u } = await supabase.auth.getUser();
+    await supabase.from("recordings").insert({
+      room_id: roomId,
+      uploaded_by: u?.user?.email,
+      file_name: filename,
+      file_url: data.path,
     });
-
     setIsRecording(false);
-  };
+    alert("Recording saved!");
+  }
 
-  const leaveRoom = async () => {
+  async function leaveRoom() {
     if (isRecording) await stopRecording();
     peerRef.current?.destroy();
-    localStreamRef.current?.getTracks().forEach((t) => t.stop());
-    Object.values(remoteVideosRef.current).forEach((n) => n.remove());
-
-    for (const ch of [
-      signalsChannel,
-      messagesChannel,
-      reactionsChannel,
-      participantsChannel,
-      waitingChannel,
-    ]) {
-      await ch.current?.unsubscribe();
-    }
-
+    localStreamRef.current?.getTracks().forEach(t => t.stop());
+    Object.values(remoteVideosRef.current).forEach(el => el.remove());
+    clearInterval(refreshInterval.current);
+    const { data: me } = await supabase.auth.getUser();
+    await supabase
+      .from("participants")
+      .delete()
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", me?.user?.id);
+    signalsChannel.current?.unsubscribe();
+    participantsChannel.current?.unsubscribe();
+    waitingChannel.current?.unsubscribe();
     navigate("/");
-  };
+  }
 
-  const sendMessage = async () => {
+  async function sendMessage() {
     if (!chatInput.trim()) return;
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-
-    const newMsg = {
+    const { data: u } = await supabase.auth.getUser();
+    const msg = {
       room_id: roomId,
-      sender: user.email,
+      sender: u.user.email,
       text: chatInput,
       created_at: new Date().toISOString(),
     };
-
-    setMessages((prev) => [...prev, newMsg]);
-    await supabase.from("messages").insert(newMsg);
+    setMessages(m => [...m, msg]);
+    await supabase.from("messages").insert(msg);
     setChatInput("");
-  };
+  }
 
-  const sendReaction = async (emoji) => {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return;
-
-    const newReaction = {
+  async function sendReaction(emoji) {
+    const { data: u } = await supabase.auth.getUser();
+    const r = {
       room_id: roomId,
-      user_id: user.id,
+      user_id: u.user.id,
       emoji,
       created_at: new Date().toISOString(),
     };
-
-    setReactions((prev) => [...prev, newReaction]);
-    setTimeout(() => {
-      setReactions((prev) => prev.filter((r) => r !== newReaction));
-    }, 3000);
-
-    await supabase.from("reactions").insert(newReaction);
-  };
+    setReactions(r0 => [...r0, r]);
+    setTimeout(() => setReactions(r0 => r0.filter(x => x !== r)), 10000);
+    await supabase.from("reactions").insert(r);
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      sender: u.user.email,
+      text: `reacted with ${emoji}`,
+      created_at: new Date().toISOString(),
+    });
+  }
 
   return (
-    <div className="p-4">
-      <h1>Room: {roomId}</h1>
-      <p>Passcode: {passcodeRequired ? "Yes" : "No"}</p>
-      <p>Host: {isHost ? "Yes" : "No"}</p>
-      <p>Participants: {participants.length}</p>
-
-      <div className="my-2">
-        <label className="font-semibold">Share this meeting link:</label>
-        <div className="flex items-center gap-2 mt-1">
-          <input
-            type="text"
-            readOnly
-            className="border p-2 rounded w-full"
-            value={`https://zoomclone-v3.vercel.app/room/${roomId}`}
-            onClick={(e) => e.target.select()}
-          />
-          <button
-            className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
-            onClick={() => {
-              navigator.clipboard.writeText(
-                `https://zoomclone-v3.vercel.app/room/${roomId}`
-              );
-              alert("Meeting link copied to clipboard!");
-            }}
-          >
-            Copy
-          </button>
-        </div>
+    <div className="p-4 space-y-4">
+      <h1>🖥 Room: {roomId}</h1>
+      <div>
+        <strong>Share link:</strong>{" "}
+        <input
+          type="text"
+          readOnly
+          value={shareLink}
+          onClick={e => e.target.select()}
+        />
+        <button
+          onClick={() => {
+            navigator.clipboard.writeText(shareLink);
+            alert("Link copied!");
+          }}
+        >
+          Copy
+        </button>
       </div>
 
       {isHost && waitingList.length > 0 && (
-        <div className="bg-yellow-100 p-2">
-          <h3>Waiting Room</h3>
-          {waitingList.map((w) => (
-            <div key={w.user_id}>
-              {w.email}{" "}
-              <button onClick={() => approveUser(w.user_id)}>✔️</button>
+        <div className="waiting-room">
+          <h2>Waiting Room ({waitingList.length})</h2>
+          {waitingList.map(w => (
+            <div key={w.user_id} className="flex items-center gap-2">
+              <span>{w.users?.email || w.user_id}</span>
+              <button onClick={() => approveUser(w.user_id)}>✅ Approve</button>
+              <button onClick={() => denyUser(w.user_id)}>❌ Deny</button>
             </div>
           ))}
         </div>
       )}
+
+      <p>
+        {isHost ? "Host" : "Guest"} — Participants: {participants.length}
+      </p>
 
       <div className="grid grid-cols-2 gap-4">
         <video
@@ -454,12 +469,16 @@ export default function MeetingRoom() {
           playsInline
           className="border"
         />
-        <div id="remote-videos" className="flex flex-wrap" />
+        <div id="remote-videos" className="flex flex-wrap gap-2" />
       </div>
 
-      <div className="mt-4 space-x-2">
-        <button onClick={toggleMute}>{isMuted ? "Unmute" : "Mute"}</button>
-        <button onClick={toggleCam}>{cameraOn ? "Cam Off" : "Cam On"}</button>
+      <div className="flex gap-2">
+        <button onClick={toggleMute}>
+          {isMuted ? "Unmute" : "Mute"}
+        </button>
+        <button onClick={toggleCam}>
+          {cameraOn ? "Camera Off" : "Camera On"}
+        </button>
         <button onClick={shareScreen}>Share Screen</button>
         {!isRecording ? (
           <button onClick={startRecording}>Start Rec</button>
@@ -467,44 +486,41 @@ export default function MeetingRoom() {
           <button onClick={stopRecording}>Stop Rec</button>
         )}
         <button onClick={() => sendReaction("👋")}>👋</button>
-        <button onClick={leaveRoom}>Leave</button>
+        <button className="text-red-600" onClick={leaveRoom}>Leave</button>
       </div>
 
-      <div className="mt-4">
-        <div className="h-40 overflow-y-auto border p-2">
-          {messages.map((m) => (
-            <div key={m.id || m.created_at}>
+      <div className="space-y-2">
+        <div className="border p-2 h-40 overflow-y-auto bg-gray-50">
+          {messages.map((m, i) => (
+            <div key={i}>
               <strong>{m.sender}:</strong> {m.text}
             </div>
           ))}
         </div>
-        <input
-          className="border w-full p-2"
-          placeholder="Message..."
-          value={chatInput}
-          onChange={(e) => setChatInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-        />
+        <div className="flex gap-2">
+          <input
+            className="flex-1 border p-2"
+            value={chatInput}
+            onChange={e => setChatInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && sendMessage()}
+            placeholder="Type message..."
+          />
+          <button onClick={sendMessage}>Send</button>
+        </div>
       </div>
 
-      <div className="fixed bottom-24 left-4 flex space-x-2 z-50">
-        {reactions.map((r, index) => (
-          <span key={index} className="text-4xl animate-bounce">
-            {r.emoji}
-          </span>
-        ))}
-      </div>
-
-      <div className="mt-2 flex gap-2">
-        {["👍", "❤️", "😂", "🎉", "😮"].map((e) => (
-          <button
-            key={e}
-            onClick={() => sendReaction(e)}
-            className="text-2xl hover:scale-110 transition-transform"
-          >
-            {e}
-          </button>
-        ))}
+      <div>
+        <strong>Reactions:</strong>
+        <div className="mt-2 flex gap-2 text-2xl">
+          {["👍", "❤️", "😂", "🎉", "😮"].map(emoji => (
+            <button key={emoji} onClick={() => sendReaction(emoji)}>
+              {emoji}
+            </button>
+          ))}
+        </div>
+        <div className="mt-2 flex gap-2 text-3xl">
+          {reactions.map((r, i) => <span key={i}>{r.emoji}</span>)}
+        </div>
       </div>
     </div>
   );
