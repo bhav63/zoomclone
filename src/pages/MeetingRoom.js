@@ -48,8 +48,8 @@ export default function MeetingRoom() {
   async function initRoom() {
     const { data: userData, error: userErr } = await supabase.auth.getUser();
     if (userErr || !userData.user) return navigate("/login");
-
     const user = userData.user;
+
     const { data: meeting } = await supabase
       .from("meetings")
       .select("*")
@@ -74,7 +74,6 @@ export default function MeetingRoom() {
       return;
     }
 
-    // Guest flow: check or create participant entry
     const { data: participantEntry } = await supabase
       .from("participants")
       .select("status")
@@ -132,8 +131,7 @@ export default function MeetingRoom() {
       .eq("meeting_id", meetingId)
       .eq("status", "pending")
       .order("created_at", { ascending: true });
-    if (error) console.error(error);
-    setWaitingList(data || []);
+    if (!error) setWaitingList(data || []);
   }
 
   function setupParticipantListener(meetingId, userId) {
@@ -147,7 +145,7 @@ export default function MeetingRoom() {
           table: "participants",
           filter: `meeting_id=eq.${meetingId},user_id=eq.${userId}`,
         },
-        payload => {
+        (payload) => {
           const newStatus = payload.new.status;
           if (newStatus === "approved") joinMeeting(meetingId, userId);
           if (newStatus === "denied") {
@@ -165,7 +163,6 @@ export default function MeetingRoom() {
       .update({ status: "approved" })
       .eq("meeting_id", meetingDbId)
       .eq("user_id", user_id);
-    updateWaitingList(meetingDbId);
   }
 
   async function denyUser(user_id) {
@@ -174,14 +171,11 @@ export default function MeetingRoom() {
       .update({ status: "denied" })
       .eq("meeting_id", meetingDbId)
       .eq("user_id", user_id);
-    updateWaitingList(meetingDbId);
   }
 
   async function joinMeeting(meetingId, userId) {
-    // fetch approved participants for UI
     updateParticipants(meetingId);
 
-    // start media
     const stream = await navigator.mediaDevices.getUserMedia({
       video: true,
       audio: true,
@@ -192,7 +186,7 @@ export default function MeetingRoom() {
     const peer = new Peer();
     peerRef.current = peer;
 
-    peer.on("open", async peerId => {
+    peer.on("open", async (peerId) => {
       await supabase.from("signals").insert({ room_id: roomId, peer_id: peerId });
 
       const { data: others } = await supabase
@@ -201,7 +195,7 @@ export default function MeetingRoom() {
         .eq("room_id", roomId)
         .neq("peer_id", peerId);
 
-      others.forEach(o => setupCall(peer.call(o.peer_id, stream), o.peer_id));
+      others.forEach((o) => setupCall(peer.call(o.peer_id, stream), o.peer_id));
 
       signalsChannel.current = supabase
         .channel(`signals:${roomId}`)
@@ -213,20 +207,22 @@ export default function MeetingRoom() {
             table: "signals",
             filter: `room_id=eq.${roomId}`,
           },
-          payload => {
+          (payload) => {
             if (payload.new.peer_id !== peerId)
-              setupCall(peer.call(payload.new.peer_id, stream), payload.new.peer_id);
+              setupCall(
+                peer.call(payload.new.peer_id, stream),
+                payload.new.peer_id
+              );
           }
         )
         .subscribe();
     });
 
-    peer.on("call", call => {
+    peer.on("call", (call) => {
       call.answer(stream);
       setupCall(call, call.peer);
     });
 
-    // messages
     const { data: oldMsgs } = await supabase
       .from("messages")
       .select("*")
@@ -244,11 +240,10 @@ export default function MeetingRoom() {
           table: "messages",
           filter: `room_id=eq.${roomId}`,
         },
-        payload => setMessages(m => [...m, payload.new])
+        (payload) => setMessages((m) => [...m, payload.new])
       )
       .subscribe();
 
-    // reactions
     supabase
       .channel(`reactions:${roomId}`)
       .on(
@@ -259,10 +254,10 @@ export default function MeetingRoom() {
           table: "reactions",
           filter: `room_id=eq.${roomId}`,
         },
-        payload => {
-          setReactions(r => [...r, payload.new]);
+        (payload) => {
+          setReactions((r) => [...r, payload.new]);
           setTimeout(
-            () => setReactions(r => r.filter(x => x.id !== payload.new.id)),
+            () => setReactions((r) => r.filter((x) => x.id !== payload.new.id)),
             10000
           );
         }
@@ -278,11 +273,11 @@ export default function MeetingRoom() {
       .select("user_id")
       .eq("meeting_id", meetingId)
       .eq("status", "approved");
-    setParticipants(data.map(p => p.user_id));
+    setParticipants(data.map((p) => p.user_id));
   }
 
   function setupCall(call, peerId) {
-    call.on("stream", stream => addRemote(peerId, stream));
+    call.on("stream", (stream) => addRemote(peerId, stream));
     call.on("close", () => removeRemote(peerId));
     call.on("error", () => removeRemote(peerId));
   }
@@ -306,31 +301,41 @@ export default function MeetingRoom() {
   }
 
   function iceRestart() {
-    Object.values(peerRef.current.connections || {}).flat().forEach(conn => {
-      conn.peerConnection.restartIce?.();
-    });
+    Object.values(peerRef.current.connections || {})
+      .flat()
+      .forEach((conn) => {
+        conn.peerConnection.restartIce?.();
+      });
   }
 
   function toggleMute() {
     const t = localStreamRef.current?.getAudioTracks()[0];
-    if (t) { t.enabled = !t.enabled; setIsMuted(!t.enabled); }
+    if (t) {
+      t.enabled = !t.enabled;
+      setIsMuted(!t.enabled);
+    }
   }
 
   function toggleCam() {
     const t = localStreamRef.current?.getVideoTracks()[0];
-    if (t) { t.enabled = !t.enabled; setCameraOn(t.enabled); }
+    if (t) {
+      t.enabled = !t.enabled;
+      setCameraOn(t.enabled);
+    }
   }
 
   async function shareScreen() {
     try {
-      const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const display = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+      });
       const track = display.getVideoTracks()[0];
       Object.values(peerRef.current.connections || {})
         .flat()
-        .forEach(conn => {
+        .forEach((conn) => {
           const sender = conn.peerConnection
             .getSenders()
-            .find(s => s.track.kind === "video");
+            .find((s) => s.track.kind === "video");
           sender?.replaceTrack(track);
         });
       track.onended = toggleCam;
@@ -341,10 +346,10 @@ export default function MeetingRoom() {
 
   function startRecording() {
     const mix = new MediaStream();
-    localStreamRef.current.getTracks().forEach(t => mix.addTrack(t));
+    localStreamRef.current.getTracks().forEach((t) => mix.addTrack(t));
     Object.values(remoteVideosRef.current)
-      .map(el => el.querySelector("video"))
-      .forEach(v => v?.srcObject.getTracks().forEach(t => mix.addTrack(t)));
+      .map((el) => el.querySelector("video"))
+      .forEach((v) => v?.srcObject.getTracks().forEach((t) => mix.addTrack(t)));
     const rec = RecordRTC(mix, { mimeType: "video/webm" });
     rec.startRecording();
     recorderRef.current = rec;
@@ -375,8 +380,8 @@ export default function MeetingRoom() {
   async function leaveRoom() {
     if (isRecording) await stopRecording();
     peerRef.current?.destroy();
-    localStreamRef.current?.getTracks().forEach(t => t.stop());
-    Object.values(remoteVideosRef.current).forEach(el => el.remove());
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    Object.values(remoteVideosRef.current).forEach((el) => el.remove());
     clearInterval(refreshInterval.current);
     const { data: me } = await supabase.auth.getUser();
     await supabase
@@ -399,7 +404,7 @@ export default function MeetingRoom() {
       text: chatInput,
       created_at: new Date().toISOString(),
     };
-    setMessages(m => [...m, msg]);
+    setMessages((m) => [...m, msg]);
     await supabase.from("messages").insert(msg);
     setChatInput("");
   }
@@ -412,8 +417,8 @@ export default function MeetingRoom() {
       emoji,
       created_at: new Date().toISOString(),
     };
-    setReactions(r0 => [...r0, r]);
-    setTimeout(() => setReactions(r0 => r0.filter(x => x !== r)), 10000);
+    setReactions((r0) => [...r0, r]);
+    setTimeout(() => setReactions((r0) => r0.filter((x) => x !== r)), 10000);
     await supabase.from("reactions").insert(r);
     await supabase.from("messages").insert({
       room_id: roomId,
@@ -432,7 +437,7 @@ export default function MeetingRoom() {
           type="text"
           readOnly
           value={shareLink}
-          onClick={e => e.target.select()}
+          onClick={(e) => e.target.select()}
         />
         <button
           onClick={() => {
@@ -445,9 +450,9 @@ export default function MeetingRoom() {
       </div>
 
       {isHost && waitingList.length > 0 && (
-        <div className="waiting-room">
+        <div className="bg-gray-100 p-4 rounded">
           <h2>Waiting Room ({waitingList.length})</h2>
-          {waitingList.map(w => (
+          {waitingList.map((w) => (
             <div key={w.user_id} className="flex items-center gap-2">
               <span>{w.users?.email || w.user_id}</span>
               <button onClick={() => approveUser(w.user_id)}>✅ Approve</button>
@@ -472,10 +477,8 @@ export default function MeetingRoom() {
         <div id="remote-videos" className="flex flex-wrap gap-2" />
       </div>
 
-      <div className="flex gap-2">
-        <button onClick={toggleMute}>
-          {isMuted ? "Unmute" : "Mute"}
-        </button>
+      <div className="flex gap-2 flex-wrap">
+        <button onClick={toggleMute}>{isMuted ? "Unmute" : "Mute"}</button>
         <button onClick={toggleCam}>
           {cameraOn ? "Camera Off" : "Camera On"}
         </button>
@@ -486,7 +489,9 @@ export default function MeetingRoom() {
           <button onClick={stopRecording}>Stop Rec</button>
         )}
         <button onClick={() => sendReaction("👋")}>👋</button>
-        <button className="text-red-600" onClick={leaveRoom}>Leave</button>
+        <button className="text-red-600" onClick={leaveRoom}>
+          Leave
+        </button>
       </div>
 
       <div className="space-y-2">
@@ -501,8 +506,8 @@ export default function MeetingRoom() {
           <input
             className="flex-1 border p-2"
             value={chatInput}
-            onChange={e => setChatInput(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && sendMessage()}
+            onChange={(e) => setChatInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
             placeholder="Type message..."
           />
           <button onClick={sendMessage}>Send</button>
@@ -512,14 +517,16 @@ export default function MeetingRoom() {
       <div>
         <strong>Reactions:</strong>
         <div className="mt-2 flex gap-2 text-2xl">
-          {["👍", "❤️", "😂", "🎉", "😮"].map(emoji => (
+          {["👍", "❤️", "😂", "🎉", "😮"].map((emoji) => (
             <button key={emoji} onClick={() => sendReaction(emoji)}>
               {emoji}
             </button>
           ))}
         </div>
         <div className="mt-2 flex gap-2 text-3xl">
-          {reactions.map((r, i) => <span key={i}>{r.emoji}</span>)}
+          {reactions.map((r, i) => (
+            <span key={i}>{r.emoji}</span>
+          ))}
         </div>
       </div>
     </div>
