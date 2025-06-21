@@ -18,13 +18,13 @@ function Auth() {
       if (isLogin) {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
-        // ✅ Redirect to a protected route after login
-        navigate('/room/12345'); // You can make this dynamic
+       
+        navigate('/room/12345'); 
       } else {
         const { error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
         alert('Sign-up successful! Check your email if confirmation is required.');
-        setIsLogin(true); // Switch to login mode
+        setIsLogin(true);
       }
     } catch (err) {
       alert(err.message);
