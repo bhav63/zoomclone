@@ -11,7 +11,7 @@ export default function WaitingRoom() {
 
   useEffect(() => {
     const fetchPending = async () => {
-      if (!user) return; // ✅ early exit if user not ready
+      if (!user) return;
 
       const { data: userMeetingData } = await supabase
         .from("participants")
@@ -35,74 +35,32 @@ export default function WaitingRoom() {
           .eq("meeting_id", userMeetingData.meeting_id)
           .eq("status", "pending");
 
-        if (!error) setPendingParticipants(data);
+        if (!error) setPendingParticipants(data || []);
       }
 
       setLoading(false);
     };
 
     fetchPending();
-  }, [user]);
+  }, [supabase, user]);
 
-  if (!user || loading) {
-    return (
-      <div className="flex items-center justify-center h-screen">
-        <p className="text-gray-500">Loading...</p>
-      </div>
-    );
-  }
+  if (loading) return <div>Loading...</div>;
 
   return (
-    <div className="flex flex-col items-center justify-center h-screen space-y-6">
-      <h1 className="text-3xl font-bold">🕐 Waiting Room</h1>
-      <p className="text-gray-600">
-        Users will wait here until approved by the host.
-      </p>
-
-      {isHost && (
-        <div className="w-full max-w-md space-y-4">
-          <h2 className="text-xl font-semibold text-center">Pending Participants</h2>
-          {pendingParticipants.length === 0 ? (
-            <p className="text-center text-gray-500">No pending users.</p>
-          ) : (
-            pendingParticipants.map((participant) => (
-              <div
-                key={participant.id}
-                className="flex justify-between items-center bg-gray-100 px-4 py-2 rounded shadow"
-              >
-                <span>User ID: {participant.user_id}</span>
-                <div className="space-x-2">
-                  <button
-                    onClick={() => updateStatus(participant.id, "approved")}
-                    className="px-3 py-1 bg-green-500 text-white rounded"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => updateStatus(participant.id, "denied")}
-                    className="px-3 py-1 bg-red-500 text-white rounded"
-                  >
-                    Deny
-                  </button>
-                </div>
-              </div>
-            ))
-          )}
+    <div className="p-4">
+      <h1>🕒 Waiting Room</h1>
+      {isHost ? (
+        <div>
+          <h2>Pending Join Requests</h2>
+          <ul>
+            {pendingParticipants.map((p) => (
+              <li key={p.id}>{p.user_id}</li>
+            ))}
+          </ul>
         </div>
+      ) : (
+        <p>Waiting for the host to let you in...</p>
       )}
     </div>
   );
-
-  async function updateStatus(id, status) {
-    const { error } = await supabase
-      .from("participants")
-      .update({ status })
-      .eq("id", id);
-
-    if (!error) {
-      setPendingParticipants((prev) =>
-        prev.filter((p) => p.id !== id)
-      );
-    }
-  }
 }

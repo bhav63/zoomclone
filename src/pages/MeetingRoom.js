@@ -42,7 +42,6 @@ export default function MeetingRoom() {
   useEffect(() => {
     initRoom();
     return () => leaveRoom();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function initRoom() {
@@ -101,6 +100,7 @@ export default function MeetingRoom() {
       alert("⛔ You have been denied entry by host.");
       return navigate("/");
     }
+
     if (status === "approved") {
       await joinMeeting(meeting.id, user.id);
     }
@@ -124,13 +124,13 @@ export default function MeetingRoom() {
   }
 
   async function updateWaitingList(meetingId) {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("participants")
       .select("user_id, users(email)")
       .eq("meeting_id", meetingId)
       .eq("status", "pending")
       .order("created_at", { ascending: true });
-    if (!error) setWaitingList(data || []);
+    setWaitingList(data || []);
   }
 
   function setupParticipantListener(meetingId, userId) {
@@ -186,9 +186,7 @@ export default function MeetingRoom() {
     peerRef.current = peer;
 
     peer.on("open", async (peerId) => {
-      await supabase
-        .from("signals")
-        .insert({ room_id: roomId, peer_id: peerId });
+      await supabase.from("signals").insert({ room_id: roomId, peer_id: peerId });
 
       const { data: others } = await supabase
         .from("signals")
@@ -233,36 +231,17 @@ export default function MeetingRoom() {
 
     supabase
       .channel(`messages:${roomId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload) => setMessages((m) => [...m, payload.new])
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (payload) =>
+        setMessages((m) => [...m, payload.new])
       )
       .subscribe();
 
     supabase
       .channel(`reactions:${roomId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "reactions",
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload) => {
-          setReactions((r) => [...r, payload.new]);
-          setTimeout(
-            () => setReactions((r) => r.filter((x) => x.id !== payload.new.id)),
-            10000
-          );
-        }
-      )
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "reactions" }, (payload) => {
+        setReactions((r) => [...r, payload.new]);
+        setTimeout(() => setReactions((r) => r.filter((x) => x.id !== payload.new.id)), 10000);
+      })
       .subscribe();
 
     refreshInterval.current = setInterval(iceRestart, 5000);
@@ -327,16 +306,12 @@ export default function MeetingRoom() {
 
   async function shareScreen() {
     try {
-      const display = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-      });
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
       const track = display.getVideoTracks()[0];
       Object.values(peerRef.current.connections || {})
         .flat()
         .forEach((conn) => {
-          const sender = conn.peerConnection
-            .getSenders()
-            .find((s) => s.track.kind === "video");
+          const sender = conn.peerConnection.getSenders().find((s) => s.track.kind === "video");
           sender?.replaceTrack(track);
         });
       track.onended = toggleCam;
@@ -358,35 +333,30 @@ export default function MeetingRoom() {
   }
 
   async function stopRecording() {
-  const rec = recorderRef.current;
-  if (!rec) return;
+    const rec = recorderRef.current;
+    if (!rec) return;
+    await rec.stopRecording();
+    const blob = rec.getBlob();
+    const filename = `rec-${roomId}-${Date.now()}.webm`;
 
-  await rec.stopRecording();
-  const blob = rec.getBlob();
-  const filename = `rec-${roomId}-${Date.now()}.webm`;
+    const { data: u } = await supabase.auth.getUser();
+    if (!u?.user?.email) return alert("User not authenticated.");
 
-  const { data: u } = await supabase.auth.getUser();
-  if (!u?.user?.email) {
-    alert("User not authenticated.");
-    return;
+    const { data, error } = await supabase.storage
+      .from("recordings")
+      .upload(filename, blob);
+    if (error) return alert("Upload failed.");
+
+    await supabase.from("recordings").insert({
+      room_id: roomId,
+      uploaded_by: u.user.email,
+      file_name: filename,
+      file_url: data.path,
+    });
+
+    setIsRecording(false);
+    alert("Recording saved!");
   }
-
-  const { data, error } = await supabase.storage
-    .from("recordings")
-    .upload(filename, blob);
-  if (error) return alert("Upload failed.");
-
-  await supabase.from("recordings").insert({
-    room_id: roomId,
-    uploaded_by: u.user.email,
-    file_name: filename,
-    file_url: data.path,
-  });
-
-  setIsRecording(false);
-  alert("Recording saved!");
-}
-
 
   async function leaveRoom() {
     if (isRecording) await stopRecording();
@@ -444,18 +414,8 @@ export default function MeetingRoom() {
       <h1>🖥 Room: {roomId}</h1>
       <div>
         <strong>Share link:</strong>{" "}
-        <input
-          type="text"
-          readOnly
-          value={shareLink}
-          onClick={(e) => e.target.select()}
-        />
-        <button
-          onClick={() => {
-            navigator.clipboard.writeText(shareLink);
-            alert("Link copied!");
-          }}
-        >
+        <input type="text" readOnly value={shareLink} onClick={(e) => e.target.select()} />
+        <button onClick={() => { navigator.clipboard.writeText(shareLink); alert("Link copied!"); }}>
           Copy
         </button>
       </div>
@@ -473,26 +433,16 @@ export default function MeetingRoom() {
         </div>
       )}
 
-      <p>
-        {isHost ? "Host" : "Guest"} — Participants: {participants.length}
-      </p>
+      <p>{isHost ? "Host" : "Guest"} — Participants: {participants.length}</p>
 
       <div className="grid grid-cols-2 gap-4">
-        <video
-          ref={localVideoRef}
-          muted
-          autoPlay
-          playsInline
-          className="border"
-        />
+        <video ref={localVideoRef} muted autoPlay playsInline className="border" />
         <div id="remote-videos" className="flex flex-wrap gap-2" />
       </div>
 
       <div className="flex gap-2 flex-wrap">
         <button onClick={toggleMute}>{isMuted ? "Unmute" : "Mute"}</button>
-        <button onClick={toggleCam}>
-          {cameraOn ? "Camera Off" : "Camera On"}
-        </button>
+        <button onClick={toggleCam}>{cameraOn ? "Camera Off" : "Camera On"}</button>
         <button onClick={shareScreen}>Share Screen</button>
         {!isRecording ? (
           <button onClick={startRecording}>Start Rec</button>
@@ -500,17 +450,13 @@ export default function MeetingRoom() {
           <button onClick={stopRecording}>Stop Rec</button>
         )}
         <button onClick={() => sendReaction("👋")}>👋</button>
-        <button className="text-red-600" onClick={leaveRoom}>
-          Leave
-        </button>
+        <button className="text-red-600" onClick={leaveRoom}>Leave</button>
       </div>
 
       <div className="space-y-2">
         <div className="border p-2 h-40 overflow-y-auto bg-gray-50">
           {messages.map((m, i) => (
-            <div key={i}>
-              <strong>{m.sender}:</strong> {m.text}
-            </div>
+            <div key={i}><strong>{m.sender}:</strong> {m.text}</div>
           ))}
         </div>
         <div className="flex gap-2">
@@ -529,9 +475,7 @@ export default function MeetingRoom() {
         <strong>Reactions:</strong>
         <div className="mt-2 flex gap-2 text-2xl">
           {["👍", "❤️", "😂", "🎉", "😮"].map((emoji) => (
-            <button key={emoji} onClick={() => sendReaction(emoji)}>
-              {emoji}
-            </button>
+            <button key={emoji} onClick={() => sendReaction(emoji)}>{emoji}</button>
           ))}
         </div>
         <div className="mt-2 flex gap-2 text-3xl">
