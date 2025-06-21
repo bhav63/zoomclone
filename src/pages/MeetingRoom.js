@@ -87,17 +87,16 @@ export default function MeetingRoom() {
         user_id: user.id,
         status: "pending",
       });
-      alert("✅ Waiting for host approval...");
       setupParticipantListener(meeting.id, user.id);
-      return;
+      return navigate("/waiting");
     }
 
     const { status } = participantEntry;
     if (status === "pending") {
-      alert("✅ Still waiting for host approval...");
       setupParticipantListener(meeting.id, user.id);
-      return;
+      return navigate("/waiting");
     }
+
     if (status === "denied") {
       alert("⛔ You have been denied entry by host.");
       return navigate("/");
@@ -187,7 +186,9 @@ export default function MeetingRoom() {
     peerRef.current = peer;
 
     peer.on("open", async (peerId) => {
-      await supabase.from("signals").insert({ room_id: roomId, peer_id: peerId });
+      await supabase
+        .from("signals")
+        .insert({ room_id: roomId, peer_id: peerId });
 
       const { data: others } = await supabase
         .from("signals")
@@ -357,25 +358,35 @@ export default function MeetingRoom() {
   }
 
   async function stopRecording() {
-    const rec = recorderRef.current;
-    if (!rec) return;
-    await rec.stopRecording();
-    const blob = rec.getBlob();
-    const filename = `rec-${roomId}-${Date.now()}.webm`;
-    const { data, error } = await supabase.storage
-      .from("recordings")
-      .upload(filename, blob);
-    if (error) return alert("Upload failed.");
-    const { data: u } = await supabase.auth.getUser();
-    await supabase.from("recordings").insert({
-      room_id: roomId,
-      uploaded_by: u?.user?.email,
-      file_name: filename,
-      file_url: data.path,
-    });
-    setIsRecording(false);
-    alert("Recording saved!");
+  const rec = recorderRef.current;
+  if (!rec) return;
+
+  await rec.stopRecording();
+  const blob = rec.getBlob();
+  const filename = `rec-${roomId}-${Date.now()}.webm`;
+
+  const { data: u } = await supabase.auth.getUser();
+  if (!u?.user?.email) {
+    alert("User not authenticated.");
+    return;
   }
+
+  const { data, error } = await supabase.storage
+    .from("recordings")
+    .upload(filename, blob);
+  if (error) return alert("Upload failed.");
+
+  await supabase.from("recordings").insert({
+    room_id: roomId,
+    uploaded_by: u.user.email,
+    file_name: filename,
+    file_url: data.path,
+  });
+
+  setIsRecording(false);
+  alert("Recording saved!");
+}
+
 
   async function leaveRoom() {
     if (isRecording) await stopRecording();
