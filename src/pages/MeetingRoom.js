@@ -563,16 +563,7 @@ export default function MeetingRoom() {
         </button>
       </div>
 
-      {/* <input
-        className="border p-2 flex-1"
-        placeholder="Type..."
-        value={chatInput}
-        onChange={(e) => setChatInput(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") sendMessage();
-        }}
-      /> */}
-
+   
       {/* Chat */}
       <div className="space-y-2">
         <div className="border p-2 h-40 overflow-y-auto bg-gray-100">
