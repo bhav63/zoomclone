@@ -1,5 +1,4 @@
 // src/pages/MeetingRoom.jsx
-
 import React, {
   useEffect,
   useRef,
@@ -36,6 +35,10 @@ export default function MeetingRoom() {
   const [cameraOn, setCameraOn] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [mediaPermissionGranted, setMediaPermissionGranted] = useState(false);
+  const [isJoining, setIsJoining] = useState(false);
+  const [waitingForApproval, setWaitingForApproval] = useState(false);
+  const [showChat, setShowChat] = useState(false);
 
   const peerRef = useRef();
   const localStreamRef = useRef();
@@ -43,6 +46,7 @@ export default function MeetingRoom() {
   const localVideoRef = useRef();
   const remoteVideosRef = useRef({});
   const refreshInterval = useRef();
+  const isMountedRef = useRef(true);
 
   const waitingChannel = useRef();
   const participantListener = useRef();
@@ -85,11 +89,87 @@ export default function MeetingRoom() {
     }
   }
 
+  // START recording
+  async function startRecording() {
+    if (!localStreamRef.current) {
+      alert("Please join the meeting first to start recording.");
+      return;
+    }
+    try {
+      const recorder = new RecordRTC(localStreamRef.current, {
+        type: 'video',
+        mimeType: 'video/webm',
+        bitsPerSecond: 128000
+      });
+      recorder.startRecording();
+      recorderRef.current = recorder;
+      setIsRecording(true);
+      alert("🔴 Recording started!");
+    } catch (err) {
+      console.error("Recording start error:", err);
+      alert("Failed to start recording.");
+    }
+  }
+
+  // Toggle mute
+  function toggleMute() {
+    if (localStreamRef.current) {
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      audioTracks.forEach(track => {
+        track.enabled = !track.enabled;
+      });
+      setIsMuted(!isMuted);
+    }
+  }
+
+  // Toggle camera
+  function toggleCamera() {
+    if (localStreamRef.current) {
+      const videoTracks = localStreamRef.current.getVideoTracks();
+      videoTracks.forEach(track => {
+        track.enabled = !track.enabled;
+      });
+      setCameraOn(!cameraOn);
+    }
+  }
+
+  // Request media permissions
+  async function requestMediaPermissions() {
+    if (localStreamRef.current) {
+      return localStreamRef.current;
+    }
+
+    try {
+      console.log("Requesting media permissions...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: true
+      });
+      
+      localStreamRef.current = stream;
+      
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+      
+      setMediaPermissionGranted(true);
+      console.log("Media permissions granted");
+      return stream;
+    } catch (err) {
+      console.error("Media permission error:", err);
+      alert("🛑 Please allow camera & mic access to join the meeting.");
+      throw err;
+    }
+  }
+
   // INIT & authorize/join logic
   const initRoom = useCallback(async () => {
-    if (isInitialized) return;
+    if (isInitialized || !isMountedRef.current) return;
     
     try {
+      console.log("Initializing room...");
+      setIsInitialized(true);
+      
       // Clean up any existing subscriptions first
       await cleanupSubscriptions();
       
@@ -106,6 +186,7 @@ export default function MeetingRoom() {
         .maybeSingle();
       if (mtErr || !mt) {
         console.error("Meeting fetch error:", mtErr);
+        alert("Meeting not found.");
         return navigate("/");
       }
 
@@ -123,14 +204,20 @@ export default function MeetingRoom() {
       }
 
       setNeedPasscode(false);
-      setIsInitialized(true);
 
-      // 4. Host: join + listen for waiting
+      // 4. Host: automatically join + listen for waiting
       if (hostStatus) {
         console.log("Setting up host...");
         setPermitToJoin(true);
-        await joinMeeting(mt.id, auth.user.id);
-        setupWaitingListener(mt.id);
+        
+        try {
+          await requestMediaPermissions();
+          await joinMeeting(mt.id, auth.user.id);
+          setupWaitingListener(mt.id);
+        } catch (err) {
+          console.error("Host setup error:", err);
+          navigate("/");
+        }
       } else {
         // Participant: check existing status
         console.log("Checking participant status...");
@@ -143,47 +230,62 @@ export default function MeetingRoom() {
 
         console.log("Existing participant record:", existing);
 
-        if (!existing) {
-          // no record -> create a pending request
-          console.log("Creating pending request...");
-          const { error: insertError } = await supabase
-            .from("participants")
-            .insert({
-              meeting_id: mt.id,
-              user_id: auth.user.id,
-              status: "pending"
-            });
+        if (!existing || existing.status === "pending") {
+          console.log("Participant needs to request access");
+          setupParticipantListener(mt.id, auth.user.id);
           
-          if (insertError) {
-            console.error("Error creating pending request:", insertError);
+          if (!existing) {
+            await createPendingRequest(mt.id, auth.user.id);
           } else {
-            console.log("Pending request created successfully");
+            setWaitingForApproval(true);
           }
-          
-          setupParticipantListener(mt.id, auth.user.id);
-        } else if (existing.status === "pending") {
-          console.log("Already pending, setting up listener...");
-          setupParticipantListener(mt.id, auth.user.id);
         } else if (existing.status === "approved") {
-          console.log("Already approved, joining meeting...");
+          console.log("Already approved, requesting permissions and joining...");
           setPermitToJoin(true);
-          await joinMeeting(mt.id, auth.user.id);
-        } else {
-          alert("⛔ Access denied.");
+          try {
+            await requestMediaPermissions();
+            await joinMeeting(mt.id, auth.user.id);
+          } catch (err) {
+            console.error("Approved participant setup error:", err);
+            navigate("/");
+          }
+        } else if (existing.status === "denied") {
+          alert("⛔ Access denied by host.");
           navigate("/");
         }
       }
     } catch (error) {
       console.error("Init room error:", error);
-      alert("Failed to initialize room. Please try again.");
+      if (isMountedRef.current) {
+        setIsInitialized(false);
+        alert("Failed to initialize room. Please try again.");
+      }
+      navigate("/");
     }
-  }, [
-    inputPasscode,
-    navigate,
-    roomId,
-    search,
-    isInitialized
-  ]);
+  }, [inputPasscode, navigate, roomId, search]);
+
+  // Create pending request
+  async function createPendingRequest(meetingId, userId) {
+    try {
+      console.log("Creating pending request...");
+      const { error } = await supabase
+        .from("participants")
+        .insert({
+          meeting_id: meetingId,
+          user_id: userId,
+          status: "pending"
+        });
+      
+      if (error) {
+        console.error("Error creating pending request:", error);
+      } else {
+        console.log("Pending request created successfully");
+        setWaitingForApproval(true);
+      }
+    } catch (error) {
+      console.error("Error in createPendingRequest:", error);
+    }
+  }
 
   // Apply passcode query param to state
   useEffect(() => {
@@ -193,138 +295,192 @@ export default function MeetingRoom() {
 
   // call init on mount and passcode change
   useEffect(() => {
+    isMountedRef.current = true;
+    
     if (!needPasscode && !isInitialized) {
       initRoom();
     }
     
     return () => {
+      isMountedRef.current = false;
       leaveRoom();
     };
-  }, [needPasscode, initRoom]);
+  }, [needPasscode]); // Removed isInitialized from dependencies
 
   // JOIN logic
   async function joinMeeting(meetingId, userId) {
+    if (isJoining) return;
+    setIsJoining(true);
+    
     console.log("Joining meeting...", meetingId, userId);
-    updateParticipants(meetingId);
-
+    
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: true
-      });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
+      const stream = await requestMediaPermissions();
+      updateParticipants(meetingId);
 
-      const peer = new Peer({ debug: 2 });
+      const peer = new Peer({ 
+        debug: 2,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+          ]
+        },
+        reconnectTimer: 5000
+      });
       peerRef.current = peer;
 
       peer.on("open", async (pid) => {
         console.log("Peer opened with ID:", pid);
-        await supabase
-          .from("signals")
-          .insert({ room_id: roomId, peer_id: pid });
+        
+        try {
+          await supabase
+            .from("signals")
+            .insert({ room_id: roomId, peer_id: pid });
 
-        const { data: others } = await supabase
-          .from("signals")
-          .select("*")
-          .eq("room_id", roomId)
-          .neq("peer_id", pid);
+          const { data: others } = await supabase
+            .from("signals")
+            .select("*")
+            .eq("room_id", roomId)
+            .neq("peer_id", pid);
 
-        others?.forEach((o) =>
-          setupCall(peer.call(o.peer_id, stream), o.peer_id)
-        );
+          others?.forEach((o) => {
+            console.log("Calling peer:", o.peer_id);
+            setupCall(peer.call(o.peer_id, stream), o.peer_id);
+          });
 
-        // Only create signals channel if it doesn't exist
-        if (!signalsChannel.current) {
-          signalsChannel.current = supabase
-            .channel(`signals:${roomId}:${Date.now()}`) // Add timestamp to make unique
-            .on(
-              "postgres_changes",
-              {
-                event: "INSERT",
-                schema: "public",
-                table: "signals",
-                filter: `room_id=eq.${roomId}`
-              },
-              (pl) => {
-                if (pl.new.peer_id !== pid) {
-                  setupCall(peer.call(pl.new.peer_id, stream), pl.new.peer_id);
+          if (!signalsChannel.current) {
+            signalsChannel.current = supabase
+              .channel(`signals:${roomId}:${Date.now()}`)
+              .on(
+                "postgres_changes",
+                {
+                  event: "INSERT",
+                  schema: "public",
+                  table: "signals",
+                  filter: `room_id=eq.${roomId}`
+                },
+                (pl) => {
+                  if (pl.new.peer_id !== pid) {
+                    console.log("New peer joined, calling:", pl.new.peer_id);
+                    setupCall(peer.call(pl.new.peer_id, stream), pl.new.peer_id);
+                  }
                 }
-              }
-            )
-            .subscribe();
+              )
+              .subscribe();
+          }
+        } catch (err) {
+          console.error("Error in peer open handler:", err);
         }
       });
 
       peer.on("call", (call) => {
+        console.log("Receiving call from:", call.peer);
         call.answer(stream);
         setupCall(call, call.peer);
       });
 
+      peer.on("error", (err) => {
+        console.error("Peer error:", err);
+      });
+
       refreshInterval.current = setInterval(() => {
-        Object.values(peerRef.current?.connections || {})
-          .flat()
-          .forEach((c) => c.peerConnection?.restartIce?.());
-      }, 6000);
+        try {
+          Object.values(peerRef.current?.connections || {})
+            .flat()
+            .forEach((c) => {
+              if (c.peerConnection && c.peerConnection.restartIce) {
+                c.peerConnection.restartIce();
+              }
+            });
+        } catch (err) {
+          console.warn("ICE restart error:", err);
+        }
+      }, 10000);
 
       loadMessagesAndReactions();
+      setIsJoining(false);
+      
     } catch (err) {
-      console.error("Join error", err);
-      alert("🛑 Please allow camera & mic access.");
-      navigate("/");
+      console.error("Join meeting error:", err);
+      setIsJoining(false);
+      alert("🛑 Failed to join meeting. Please check your camera and microphone permissions.");
     }
   }
 
   function setupCall(call, peerId) {
-    call.on("stream", (st) => addRemote(peerId, st));
-    call.on("close", () => removeRemote(peerId));
-    call.on("error", () => removeRemote(peerId));
+    console.log("Setting up call with:", peerId);
+    
+    call.on("stream", (st) => {
+      console.log("Received stream from:", peerId);
+      addRemote(peerId, st);
+    });
+    
+    call.on("close", () => {
+      console.log("Call closed with:", peerId);
+      removeRemote(peerId);
+    });
+    
+    call.on("error", (err) => {
+      console.error("Call error with", peerId, ":", err);
+      removeRemote(peerId);
+    });
   }
 
   function addRemote(id, st) {
-    if (remoteVideosRef.current[id]) return;
+    if (remoteVideosRef.current[id]) {
+      console.log("Remote video already exists for:", id);
+      return;
+    }
+    
+    console.log("Adding remote video for:", id);
     const div = document.createElement("div");
-    div.className = "relative";
+    div.className = "relative bg-black rounded";
     const vid = document.createElement("video");
     vid.srcObject = st;
     vid.autoplay = true;
     vid.playsInline = true;
-    vid.className = "border bg-black w-full h-32";
+    vid.className = "border bg-black w-full h-32 rounded";
+    
+    const label = document.createElement("div");
+    label.className = "absolute top-1 left-1 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+    label.textContent = id.substring(0, 8);
+    
     div.appendChild(vid);
+    div.appendChild(label);
     remoteVideosRef.current[id] = div;
-    document.getElementById("remote-videos")?.appendChild(div);
+    
+    const container = document.getElementById("remote-videos");
+    if (container) {
+      container.appendChild(div);
+    }
   }
 
   function removeRemote(id) {
+    console.log("Removing remote video for:", id);
     const el = remoteVideosRef.current[id];
-    if (el) el.remove();
-    delete remoteVideosRef.current[id];
+    if (el) {
+      el.remove();
+      delete remoteVideosRef.current[id];
+    }
   }
 
   // Clean up all subscriptions
   async function cleanupSubscriptions() {
     try {
-      if (signalsChannel.current) {
-        await signalsChannel.current.unsubscribe();
-        signalsChannel.current = null;
-      }
-      if (waitingChannel.current) {
-        await waitingChannel.current.unsubscribe();
-        waitingChannel.current = null;
-      }
-      if (participantListener.current) {
-        await participantListener.current.unsubscribe();
-        participantListener.current = null;
-      }
-      if (messagesChannel.current) {
-        await messagesChannel.current.unsubscribe();
-        messagesChannel.current = null;
-      }
-      if (reactionsChannel.current) {
-        await reactionsChannel.current.unsubscribe();
-        reactionsChannel.current = null;
+      const channels = [
+        signalsChannel,
+        waitingChannel,
+        participantListener,
+        messagesChannel,
+        reactionsChannel
+      ];
+
+      for (const channelRef of channels) {
+        if (channelRef.current) {
+          await channelRef.current.unsubscribe();
+          channelRef.current = null;
+        }
       }
     } catch (error) {
       console.warn("Error cleaning up subscriptions:", error);
@@ -333,12 +489,32 @@ export default function MeetingRoom() {
 
   // CLEANUP on leave/unmount
   async function leaveRoom() {
+    if (!isMountedRef.current) return;
+    
     try {
+      console.log("Leaving room...");
+      
       if (isRecording) await stopRecording();
-      peerRef.current?.destroy();
-      localStreamRef.current?.getTracks()?.forEach((t) => t.stop());
+      
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+      }
+      
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => {
+          track.stop();
+        });
+        localStreamRef.current = null;
+      }
+      
       Object.values(remoteVideosRef.current).forEach((el) => el.remove());
-      clearInterval(refreshInterval.current);
+      remoteVideosRef.current = {};
+      
+      if (refreshInterval.current) {
+        clearInterval(refreshInterval.current);
+        refreshInterval.current = null;
+      }
 
       if (meetingDbId && user?.id) {
         await supabase
@@ -348,11 +524,13 @@ export default function MeetingRoom() {
           .eq("user_id", user.id);
       }
 
-      // Clean up all subscriptions
       await cleanupSubscriptions();
       
-      // Reset state
       setIsInitialized(false);
+      setMediaPermissionGranted(false);
+      setPermitToJoin(false);
+      setWaitingForApproval(false);
+      
     } catch (err) {
       console.warn("Leave room error:", err);
     }
@@ -363,41 +541,20 @@ export default function MeetingRoom() {
     console.log("Setting up waiting listener for meeting:", mtId);
     updateWaitingList(mtId);
     
-    // Only create channel if it doesn't exist
     if (!waitingChannel.current) {
       waitingChannel.current = supabase
-        .channel(`waiting:${mtId}:${Date.now()}`) // Add timestamp to make unique
+        .channel(`waiting:${mtId}:${Date.now()}`)
         .on(
           "postgres_changes",
           {
-            event: "INSERT",
+            event: "*",
             schema: "public",
             table: "participants",
             filter: `meeting_id=eq.${mtId}`
           },
-          (payload) => {
-            console.log("New participant request:", payload.new);
-            if (payload.new.status === "pending") {
-              updateWaitingList(mtId);
-            }
-          }
+          () => updateWaitingList(mtId)
         )
-        .on(
-          "postgres_changes",
-          {
-            event: "UPDATE",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId}`
-          },
-          (payload) => {
-            console.log("Participant status updated:", payload.new);
-            updateWaitingList(mtId);
-          }
-        )
-        .subscribe((status) => {
-          console.log("Waiting channel subscription status:", status);
-        });
+        .subscribe();
     }
   }
 
@@ -405,7 +562,11 @@ export default function MeetingRoom() {
     try {
       const { data, error } = await supabase
         .from("participants")
-        .select("user_id, users!inner(email)")
+        .select(`
+          user_id,
+          created_at,
+          users!inner(email, id)
+        `)
         .eq("meeting_id", mtId)
         .eq("status", "pending")
         .order("created_at", { ascending: true });
@@ -431,14 +592,11 @@ export default function MeetingRoom() {
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
       
-      if (error) {
-        console.error("Error approving user:", error);
-      } else {
-        console.log("User approved successfully");
-        updateWaitingList(meetingDbId);
-      }
+      if (error) throw error;
+      console.log("User approved successfully");
     } catch (error) {
-      console.error("Error in approveUser:", error);
+      console.error("Error approving user:", error);
+      alert("Failed to approve user. Please try again.");
     }
   }
 
@@ -451,14 +609,11 @@ export default function MeetingRoom() {
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
       
-      if (error) {
-        console.error("Error denying user:", error);
-      } else {
-        console.log("User denied successfully");
-        updateWaitingList(meetingDbId);
-      }
+      if (error) throw error;
+      console.log("User denied successfully");
     } catch (error) {
-      console.error("Error in denyUser:", error);
+      console.error("Error denying user:", error);
+      alert("Failed to deny user. Please try again.");
     }
   }
 
@@ -466,10 +621,9 @@ export default function MeetingRoom() {
   function setupParticipantListener(mtId, uid) {
     console.log("Setting up participant listener for:", mtId, uid);
     
-    // Only create channel if it doesn't exist
     if (!participantListener.current) {
       participantListener.current = supabase
-        .channel(`participants:${mtId}:${uid}:${Date.now()}`) // Add timestamp to make unique
+        .channel(`participants:${mtId}:${uid}:${Date.now()}`)
         .on(
           "postgres_changes",
           {
@@ -481,18 +635,24 @@ export default function MeetingRoom() {
           async (payload) => {
             console.log("Participant status change received:", payload.new);
             if (payload.new.status === "approved") {
-              alert("✅ Approved! Joining...");
+              setWaitingForApproval(false);
               setPermitToJoin(true);
-              await joinMeeting(mtId, uid);
+              alert("✅ Approved! Joining meeting...");
+              try {
+                await requestMediaPermissions();
+                await joinMeeting(mtId, uid);
+              } catch (err) {
+                console.error("Error joining after approval:", err);
+                alert("Failed to join meeting. Please refresh and try again.");
+              }
             } else if (payload.new.status === "denied") {
-              alert("⛔ Denied by host.");
+              setWaitingForApproval(false);
+              alert("⛔ Access denied by host.");
               navigate("/");
             }
           }
         )
-        .subscribe((status) => {
-          console.log("Participant listener subscription status:", status);
-        });
+        .subscribe();
     }
   }
 
@@ -520,10 +680,9 @@ export default function MeetingRoom() {
         .order("created_at", { ascending: true });
       setMessages(oldMsgs || []);
 
-      // Only create messages channel if it doesn't exist
       if (!messagesChannel.current) {
         messagesChannel.current = supabase
-          .channel(`messages:${roomId}:${Date.now()}`) // Add timestamp to make unique
+          .channel(`messages:${roomId}:${Date.now()}`)
           .on(
             "postgres_changes",
             {
@@ -544,10 +703,9 @@ export default function MeetingRoom() {
         .order("created_at", { ascending: true });
       setReactions(oldReacts || []);
 
-      // Only create reactions channel if it doesn't exist
       if (!reactionsChannel.current) {
         reactionsChannel.current = supabase
-          .channel(`reactions:${roomId}:${Date.now()}`) // Add timestamp to make unique
+          .channel(`reactions:${roomId}:${Date.now()}`)
           .on(
             "postgres_changes",
             {
@@ -609,14 +767,10 @@ export default function MeetingRoom() {
           onConflict: "meeting_id,user_id"
         });
       
-      if (error) {
-        console.error("Error requesting to join:", error);
-        alert("Failed to send request. Please try again.");
-      } else {
-        console.log("Join request sent successfully");
-        setupParticipantListener(meetingDbId, user.id);
-        alert("Request sent! Waiting for host approval...");
-      }
+      if (error) throw error;
+      console.log("Join request sent successfully");
+      setWaitingForApproval(true);
+      setupParticipantListener(meetingDbId, user.id);
     } catch (error) {
       console.error("Error in requestToJoin:", error);
       alert("Failed to send request. Please try again.");
@@ -626,291 +780,323 @@ export default function MeetingRoom() {
   // UI render
   if (needPasscode) {
     return (
-      <div className="p-4">
-        <h2>🔐 Enter Passcode</h2>
-        <input
-          type="password"
-          className="border p-2"
-          value={inputPasscode}
-          onChange={(e) => setInputPasscode(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && setNeedPasscode(false)}
-        />
-        <button
-          onClick={() => {
-            setNeedPasscode(false);
-          }}
-          className="p-2 bg-blue-500 text-white mt-2 ml-2 rounded"
-        >
-          Join
-        </button>
+      <div className="p-4 max-w-md mx-auto">
+        <div className="bg-white rounded-lg shadow-lg p-6">
+          <h2 className="text-xl font-bold mb-4">🔐 Enter Meeting Passcode</h2>
+          <input
+            type="password"
+            className="border border-gray-300 p-3 w-full rounded-lg mb-4"
+            placeholder="Enter passcode"
+            value={inputPasscode}
+            onChange={(e) => setInputPasscode(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && setNeedPasscode(false)}
+          />
+          <button
+            onClick={() => setNeedPasscode(false)}
+            className="w-full p-3 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600"
+          >
+            Join Meeting
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="p-4 space-y-4">
-      <h1>📹 Room: {roomId}</h1>
-      <div>
-        <input
-          value={shareLink}
-          readOnly
-          onClick={(e) => e.target.select()}
-          className="border p-1 w-3/4"
-        />
-        <button
-          onClick={() => {
-            navigator.clipboard.writeText(shareLink);
-            alert("Copied!");
-          }}
-          className="ml-2 p-2 bg-gray-200 rounded"
-        >
-          Copy
-        </button>
+    <div className="p-4 space-y-4 max-w-6xl mx-auto">
+      <div className="bg-white rounded-lg shadow-sm border p-4">
+        <h1 className="text-2xl font-bold mb-4">📹 Meeting Room: {roomId}</h1>
+        <div className="flex gap-2">
+          <input
+            value={shareLink}
+            readOnly
+            onClick={(e) => e.target.select()}
+            className="border border-gray-300 p-2 flex-1 rounded-lg"
+          />
+          <button
+            onClick={() => {
+              navigator.clipboard.writeText(shareLink);
+              alert("Meeting link copied!");
+            }}
+            className="px-4 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600"
+          >
+            Copy Link
+          </button>
+        </div>
       </div>
 
+      {/* Waiting List for Host */}
       {isHost && waitingList.length > 0 && (
-        <div className="border p-4 rounded bg-yellow-50">
-          <h2 className="font-bold">Waiting Participants ({waitingList.length})</h2>
-          {waitingList.map((w) => (
-            <div
-              key={w.user_id}
-              className="flex items-center gap-2 my-2 p-2 bg-white rounded border"
-            >
-              <span className="flex-1">{w.users.email}</span>
-              <button
-                onClick={() => approveUser(w.user_id)}
-                className="px-3 py-1 bg-green-500 text-white rounded hover:bg-green-600"
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <h2 className="font-bold text-lg mb-3">
+            👥 Participants Waiting to Join ({waitingList.length})
+          </h2>
+          <div className="space-y-2">
+            {waitingList.map((w) => (
+              <div
+                key={w.user_id}
+                className="flex items-center gap-3 p-3 bg-white rounded-lg border shadow-sm"
               >
-                ✅ Approve
-              </button>
-              <button 
-                onClick={() => denyUser(w.user_id)}
-                className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600"
-              >
-                ❌ Deny
-              </button>
-            </div>
-          ))}
+                <div className="flex-1">
+                  <p className="font-medium">{w.users.email}</p>
+                  <p className="text-sm text-gray-500">
+                    Requested at: {new Date(w.created_at).toLocaleTimeString()}
+                  </p>
+                </div>
+                <button
+                  onClick={() => approveUser(w.user_id)}
+                  className="px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 font-medium"
+                >
+                  ✅ Approve
+                </button>
+                <button 
+                  onClick={() => denyUser(w.user_id)}
+                  className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 font-medium"
+                >
+                  ❌ Deny
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
-      <div className="p-2 bg-gray-100 rounded">
-        <p className="font-medium">
-          Status: {isHost
-            ? "🎯 You are the Host"
-            : permitToJoin
-            ? "🎉 Approved Participant"
-            : "👋 Guest — waiting for approval"}
-        </p>
+      {/* Status Display */}
+      <div className="bg-gray-50 border rounded-lg p-4">
+        <div className="flex items-center gap-4 text-sm">
+          <span className={`px-3 py-1 rounded-full font-medium ${
+            isHost ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-800'
+          }`}>
+            {isHost ? '👑 Host' : '👤 Participant'}
+          </span>
+          
+          {waitingForApproval && (
+            <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full font-medium">
+              ⏳ Waiting for host approval...
+            </span>
+          )}
+          
+          {permitToJoin && mediaPermissionGranted && (
+            <span className="px-3 py-1 bg-green-100 text-green-800 rounded-full font-medium">
+              ✅ Connected
+            </span>
+          )}
+          
+          {isRecording && (
+            <span className="px-3 py-1 bg-red-100 text-red-800 rounded-full font-medium animate-pulse">
+              🔴 Recording
+            </span>
+          )}
+        </div>
       </div>
 
-      {!permitToJoin && !isHost && (
-        <button
-          onClick={requestToJoin}
-          className="bg-green-600 text-white p-3 rounded font-medium hover:bg-green-700"
-        >
-          Request to Join Meeting
-        </button>
+      {/* Request to Join Button (for non-host users) */}
+      {!isHost && !permitToJoin && !waitingForApproval && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-6 text-center">
+          <h2 className="text-xl font-bold mb-3">🚪 Ready to Join?</h2>
+          <p className="text-gray-600 mb-4">
+            Click the button below to request access to this meeting.
+          </p>
+          <button
+            onClick={requestToJoin}
+            disabled={isJoining}
+            className="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isJoining ? '⏳ Requesting...' : '🙋 Request to Join Meeting'}
+          </button>
+        </div>
       )}
 
-      {(permitToJoin || isHost) && (
+      {/* Main Meeting Interface */}
+      {permitToJoin && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <h3 className="font-medium mb-2">Your Video</h3>
-              <video
-                ref={localVideoRef}
-                muted
-                autoPlay
-                playsInline
-                className="border bg-black w-full h-48 rounded"
+          {/* Video Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+            {/* Local Video */}
+            <div className="lg:col-span-3">
+              <div className="bg-black rounded-lg overflow-hidden relative">
+                <video
+                  ref={localVideoRef}
+                  autoPlay
+                  muted
+                  playsInline
+                  className="w-full h-64 lg:h-96 object-cover"
+                />
+                <div className="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-sm px-2 py-1 rounded">
+                  You {isMuted ? '🔇' : '🎤'} {cameraOn ? '📹' : '📹❌'}
+                </div>
+              </div>
+              
+              {/* Remote Videos */}
+              <div 
+                id="remote-videos" 
+                className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 mt-4"
               />
             </div>
-            <div>
-              <h3 className="font-medium mb-2">Other Participants</h3>
-              <div
-                id="remote-videos"
-                className="flex flex-wrap gap-2 min-h-48 border rounded p-2 bg-gray-50"
-              />
+
+            {/* Chat Panel */}
+            <div className="lg:col-span-1">
+              <div className="bg-white rounded-lg shadow border h-96 flex flex-col">
+                <div className="flex border-b">
+                  <button
+                    onClick={() => setShowChat(true)}
+                    className={`flex-1 p-3 font-medium ${
+                      showChat ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'
+                    }`}
+                  >
+                    💬 Chat
+                  </button>
+                  <button
+                    onClick={() => setShowChat(false)}
+                    className={`flex-1 p-3 font-medium ${
+                      !showChat ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'
+                    }`}
+                  >
+                    😊 Reactions
+                  </button>
+                </div>
+
+                {showChat ? (
+                  <>
+                    {/* Messages */}
+                    <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                      {messages.map((msg, idx) => (
+                        <div key={idx} className="text-sm">
+                          <div className="font-medium text-blue-600">{msg.sender}</div>
+                          <div className="text-gray-800">{msg.text}</div>
+                          <div className="text-xs text-gray-500">
+                            {new Date(msg.created_at).toLocaleTimeString()}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    
+                    {/* Chat Input */}
+                    <div className="p-3 border-t">
+                      <div className="flex gap-2">
+                        <input
+                          value={chatInput}
+                          onChange={(e) => setChatInput(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                          placeholder="Type a message..."
+                          className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                        />
+                        <button
+                          onClick={sendMessage}
+                          className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 text-sm"
+                        >
+                          Send
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* Reactions Display */}
+                    <div className="flex-1 overflow-y-auto p-3 space-y-1">
+                      {reactions.slice(-20).map((reaction, idx) => (
+                        <div key={idx} className="text-sm flex items-center gap-2">
+                          <span className="text-2xl">{reaction.emoji}</span>
+                          <span className="text-xs text-gray-500">
+                            {new Date(reaction.created_at).toLocaleTimeString()}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    
+                    {/* Reaction Buttons */}
+                    <div className="p-3 border-t">
+                      <div className="grid grid-cols-4 gap-2">
+                        {['👍', '❤️', '😂', '😮', '😢', '👏', '🔥', '🎉'].map((emoji) => (
+                          <button
+                            key={emoji}
+                            onClick={() => sendReaction(emoji)}
+                            className="p-2 text-2xl hover:bg-gray-100 rounded-lg transition-colors"
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
           </div>
 
-          {/* Controls */}
-          <div className="flex flex-wrap gap-2">
-            <button
-              onClick={() => {
-                const t = localStreamRef.current?.getAudioTracks()[0];
-                if (t) {
-                  t.enabled = !t.enabled;
-                  setIsMuted(!t.enabled);
-                }
-              }}
-              className={`px-3 py-2 rounded font-medium ${
-                isMuted ? "bg-red-500 text-white" : "bg-gray-200"
-              }`}
-            >
-              {isMuted ? "🔇 Unmute" : "🔊 Mute"}
-            </button>
-            <button
-              onClick={() => {
-                const t = localStreamRef.current?.getVideoTracks()[0];
-                if (t) {
-                  t.enabled = !t.enabled;
-                  setCameraOn(t.enabled);
-                }
-              }}
-              className={`px-3 py-2 rounded font-medium ${
-                !cameraOn ? "bg-red-500 text-white" : "bg-gray-200"
-              }`}
-            >
-              {cameraOn ? "📹 Cam Off" : "📷 Cam On"}
-            </button>
-            <button
-              onClick={async () => {
-                try {
-                  const d = await navigator.mediaDevices.getDisplayMedia({
-                    video: true
-                  });
-                  const tr = d.getVideoTracks()[0];
-                  Object.values(peerRef.current?.connections || {})
-                    .flat()
-                    .forEach((c) => {
-                      const s = c.peerConnection
-                        ?.getSenders()
-                        ?.find((s) => s.track?.kind === "video");
-                      if (s && tr) {
-                        s.replaceTrack(tr);
-                      }
-                    });
-                  tr.onended = () => {
-                    const orig = localStreamRef.current?.getVideoTracks()[0];
-                    Object.values(peerRef.current?.connections || {})
-                      .flat()
-                      .forEach((c) => {
-                        const s = c.peerConnection
-                          ?.getSenders()
-                          ?.find((s) => s.track?.kind === "video");
-                        if (s && orig) {
-                          s.replaceTrack(orig);
-                        }
-                      });
-                  };
-                } catch {
-                  alert("Screen sharing failed");
-                }
-              }}
-              className="px-3 py-2 bg-blue-500 text-white rounded font-medium hover:bg-blue-600"
-            >
-              🖥️ Share Screen
-            </button>
-            {!isRecording ? (
+          {/* Control Bar */}
+          <div className="bg-white rounded-lg shadow border p-4">
+            <div className="flex justify-center items-center gap-4">
+              {/* Mute Button */}
+              <button
+                onClick={toggleMute}
+                className={`p-3 rounded-full font-medium transition-colors ${
+                  isMuted 
+                    ? 'bg-red-500 hover:bg-red-600 text-white' 
+                    : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                }`}
+              >
+                {isMuted ? '🔇' : '🎤'}
+              </button>
+
+              {/* Camera Button */}
+              <button
+                onClick={toggleCamera}
+                className={`p-3 rounded-full font-medium transition-colors ${
+                  !cameraOn 
+                    ? 'bg-red-500 hover:bg-red-600 text-white' 
+                    : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                }`}
+              >
+                {cameraOn ? '📹' : '📹❌'}
+              </button>
+
+              {/* Recording Button */}
+              <button
+                onClick={isRecording ? stopRecording : startRecording}
+                className={`px-4 py-3 rounded-full font-medium transition-colors ${
+                  isRecording 
+                    ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse' 
+                    : 'bg-blue-500 hover:bg-blue-600 text-white'
+                }`}
+              >
+                {isRecording ? '⏹️ Stop Recording' : '🔴 Start Recording'}
+              </button>
+
+              {/* Leave Button */}
               <button
                 onClick={() => {
-                  try {
-                    const mix = new MediaStream();
-                    localStreamRef.current
-                      ?.getTracks()
-                      ?.forEach((t) => mix.addTrack(t));
-                    Object.values(remoteVideosRef.current)
-                      .map((div) => div.querySelector("video"))
-                      .forEach((v) =>
-                        v?.srcObject
-                          ?.getTracks()
-                          ?.forEach((t) => mix.addTrack(t))
-                      );
-                    const r = RecordRTC(mix, {
-                      mimeType: "video/webm"
-                    });
-                    r.startRecording();
-                    recorderRef.current = r;
-                    setIsRecording(true);
-                  } catch (error) {
-                    console.error("Recording start error:", error);
-                    alert("Failed to start recording");
+                  if (window.confirm('Are you sure you want to leave the meeting?')) {
+                    leaveRoom();
+                    navigate('/');
                   }
                 }}
-                className="px-3 py-2 bg-purple-500 text-white rounded font-medium hover:bg-purple-600"
+                className="px-4 py-3 bg-red-500 hover:bg-red-600 text-white rounded-full font-medium transition-colors"
               >
-                🔴 Start Recording
-              </button>
-            ) : (
-              <button
-                onClick={stopRecording}
-                className="px-3 py-2 bg-red-500 text-white rounded font-medium hover:bg-red-600 animate-pulse"
-              >
-                ⏹️ Stop Recording
-              </button>
-            )}
-            <button
-              onClick={() => {
-                if (window.confirm("Are you sure you want to leave the meeting?")) {
-                  leaveRoom();
-                  navigate("/");
-                }
-              }}
-              className="px-3 py-2 bg-red-600 text-white rounded font-medium hover:bg-red-700"
-            >
-              🚪 Leave
-            </button>
-          </div>
-
-          {/* Chat */}
-          <div className="space-y-2">
-            <h3 className="font-medium">💬 Chat</h3>
-            <div className="border p-2 h-40 overflow-y-auto bg-gray-100 rounded">
-              {messages.length === 0 ? (
-                <p className="text-gray-500">No messages yet...</p>
-              ) : (
-                messages.map((m, i) => (
-                  <div key={i} className="mb-1">
-                    <strong className="text-blue-600">{m.sender}:</strong> {m.text}
-                  </div>
-                ))
-              )}
-            </div>
-            <div className="flex gap-2">
-              <input
-                className="border p-2 flex-1 rounded"
-                placeholder="Type your message..."
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-              />
-              <button
-                onClick={sendMessage}
-                className="px-4 py-2 bg-blue-500 text-white rounded font-medium hover:bg-blue-600"
-              >
-                Send
+                📞❌ Leave Meeting
               </button>
             </div>
           </div>
 
-          {/* Reactions */}
-          <div>
-            <h3 className="font-medium mb-2">😊 Quick Reactions</h3>
-            <div className="flex gap-2 text-2xl mb-2">
-              {["👍", "❤️", "😂", "🎉", "😮"].map((e) => (
-                <button
-                  key={e}
-                  onClick={() => sendReaction(e)}
-                  className="hover:scale-125 transition-transform"
-                  title={`Send ${e} reaction`}
-                >
-                  {e}
-                </button>
-              ))}
-            </div>
-            {reactions.length > 0 && (
-              <div className="flex gap-1 text-2xl bg-gray-100 p-2 rounded">
-                {reactions.slice(-10).map((r, i) => (
-                  <span key={i} className="animate-bounce">
-                    {r.emoji}
-                  </span>
-                ))}
-              </div>
-            )}
+          {/* Meeting Info */}
+          <div className="bg-gray-50 rounded-lg p-4 text-center text-sm text-gray-600">
+            <p>
+              Meeting ID: <span className="font-mono font-bold">{roomId}</span> | 
+              Participants: <span className="font-bold">{participants.length + 1}</span> |
+              Status: <span className="font-bold">
+                {mediaPermissionGranted ? 'Connected' : 'Connecting...'}
+              </span>
+            </p>
           </div>
         </>
+      )}
+
+      {/* Loading State */}
+      {!permitToJoin && !waitingForApproval && !needPasscode && (
+        <div className="text-center py-8">
+          <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+          <p className="mt-2 text-gray-600">Initializing meeting room...</p>
+        </div>
       )}
     </div>
   );
