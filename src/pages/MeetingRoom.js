@@ -1,15 +1,6 @@
 // src/pages/MeetingRoom.jsx
-import React, {
-  useEffect,
-  useRef,
-  useState,
-  useCallback
-} from "react";
-import {
-  useParams,
-  useNavigate,
-  useLocation
-} from "react-router-dom";
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import Peer from "peerjs";
 import RecordRTC from "recordrtc";
 import { supabase } from "../supabaseClient";
@@ -79,7 +70,7 @@ export default function MeetingRoom() {
         room_id: roomId,
         uploaded_by: ur.user.email,
         file_name: filename,
-        file_url: data.path
+        file_url: data.path,
       });
       alert("✅ Recording saved!");
       setIsRecording(false);
@@ -97,9 +88,9 @@ export default function MeetingRoom() {
     }
     try {
       const recorder = new RecordRTC(localStreamRef.current, {
-        type: 'video',
-        mimeType: 'video/webm',
-        bitsPerSecond: 128000
+        type: "video",
+        mimeType: "video/webm",
+        bitsPerSecond: 128000,
       });
       recorder.startRecording();
       recorderRef.current = recorder;
@@ -115,7 +106,7 @@ export default function MeetingRoom() {
   function toggleMute() {
     if (localStreamRef.current) {
       const audioTracks = localStreamRef.current.getAudioTracks();
-      audioTracks.forEach(track => {
+      audioTracks.forEach((track) => {
         track.enabled = !track.enabled;
       });
       setIsMuted(!isMuted);
@@ -126,7 +117,7 @@ export default function MeetingRoom() {
   function toggleCamera() {
     if (localStreamRef.current) {
       const videoTracks = localStreamRef.current.getVideoTracks();
-      videoTracks.forEach(track => {
+      videoTracks.forEach((track) => {
         track.enabled = !track.enabled;
       });
       setCameraOn(!cameraOn);
@@ -143,15 +134,15 @@ export default function MeetingRoom() {
       console.log("Requesting media permissions...");
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
-        video: true
+        video: true,
       });
-      
+
       localStreamRef.current = stream;
-      
+
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
-      
+
       setMediaPermissionGranted(true);
       console.log("Media permissions granted");
       return stream;
@@ -162,23 +153,44 @@ export default function MeetingRoom() {
     }
   }
 
+  async function ensureProfileExists(userId) {
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser();
+    if (authError) throw authError;
+
+    const { error } = await supabase
+      .from("profiles")
+      .upsert({ id: userId, email: user.email }, { onConflict: "id" });
+
+    if (error) throw error;
+  }
+
   // INIT & authorize/join logic
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
-    
+
     try {
       console.log("Initializing room...");
       setIsInitialized(true);
-      
-      // Clean up any existing subscriptions first
-      await cleanupSubscriptions();
-      
-      // 1. Check auth
-      const { data: auth } = await supabase.auth.getUser();
-      if (!auth?.user) return navigate("/login");
+
+      // Check auth and get user
+      const { data: auth, error: authError } = await supabase.auth.getUser();
+      if (authError || !auth?.user) throw new Error("Not authenticated");
+
+      // Ensure user profile exists
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .upsert(
+          { id: auth.user.id, email: auth.user.email },
+          { onConflict: "id" }
+        );
+      if (profileError) throw profileError;
+
       setUser(auth.user);
 
-      // 2. Fetch meeting row
+      // Rest of your initialization logic...
       const { data: mt, error: mtErr } = await supabase
         .from("meetings")
         .select("*")
@@ -209,7 +221,7 @@ export default function MeetingRoom() {
       if (hostStatus) {
         console.log("Setting up host...");
         setPermitToJoin(true);
-        
+
         try {
           await requestMediaPermissions();
           await joinMeeting(mt.id, auth.user.id);
@@ -233,14 +245,16 @@ export default function MeetingRoom() {
         if (!existing || existing.status === "pending") {
           console.log("Participant needs to request access");
           setupParticipantListener(mt.id, auth.user.id);
-          
+
           if (!existing) {
             await createPendingRequest(mt.id, auth.user.id);
           } else {
             setWaitingForApproval(true);
           }
         } else if (existing.status === "approved") {
-          console.log("Already approved, requesting permissions and joining...");
+          console.log(
+            "Already approved, requesting permissions and joining..."
+          );
           setPermitToJoin(true);
           try {
             await requestMediaPermissions();
@@ -258,7 +272,7 @@ export default function MeetingRoom() {
       console.error("Init room error:", error);
       if (isMountedRef.current) {
         setIsInitialized(false);
-        alert("Failed to initialize room. Please try again.");
+        alert(error.message || "Failed to initialize room");
       }
       navigate("/");
     }
@@ -268,22 +282,30 @@ export default function MeetingRoom() {
   async function createPendingRequest(meetingId, userId) {
     try {
       console.log("Creating pending request...");
-      const { error } = await supabase
-        .from("participants")
-        .insert({
+
+      // First ensure profile exists
+      await ensureProfileExists(userId);
+
+      // Then create participant record with timestamp
+      const { error } = await supabase.from("participants").upsert(
+        {
           meeting_id: meetingId,
           user_id: userId,
-          status: "pending"
-        });
-      
-      if (error) {
-        console.error("Error creating pending request:", error);
-      } else {
-        console.log("Pending request created successfully");
-        setWaitingForApproval(true);
-      }
+          status: "pending",
+          created_at: new Date().toISOString(),
+        },
+        {
+          onConflict: "meeting_id,user_id",
+        }
+      );
+
+      if (error) throw error;
+
+      console.log("Pending request created successfully");
+      setWaitingForApproval(true);
     } catch (error) {
       console.error("Error in createPendingRequest:", error);
+      alert("Failed to create join request. Please try again.");
     }
   }
 
@@ -296,11 +318,11 @@ export default function MeetingRoom() {
   // call init on mount and passcode change
   useEffect(() => {
     isMountedRef.current = true;
-    
+
     if (!needPasscode && !isInitialized) {
       initRoom();
     }
-    
+
     return () => {
       isMountedRef.current = false;
       leaveRoom();
@@ -311,28 +333,28 @@ export default function MeetingRoom() {
   async function joinMeeting(meetingId, userId) {
     if (isJoining) return;
     setIsJoining(true);
-    
+
     console.log("Joining meeting...", meetingId, userId);
-    
+
     try {
       const stream = await requestMediaPermissions();
       updateParticipants(meetingId);
 
-      const peer = new Peer({ 
+      const peer = new Peer({
         debug: 2,
         config: {
           iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
-          ]
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+          ],
         },
-        reconnectTimer: 5000
+        reconnectTimer: 5000,
       });
       peerRef.current = peer;
 
       peer.on("open", async (pid) => {
         console.log("Peer opened with ID:", pid);
-        
+
         try {
           await supabase
             .from("signals")
@@ -358,12 +380,15 @@ export default function MeetingRoom() {
                   event: "INSERT",
                   schema: "public",
                   table: "signals",
-                  filter: `room_id=eq.${roomId}`
+                  filter: `room_id=eq.${roomId}`,
                 },
                 (pl) => {
                   if (pl.new.peer_id !== pid) {
                     console.log("New peer joined, calling:", pl.new.peer_id);
-                    setupCall(peer.call(pl.new.peer_id, stream), pl.new.peer_id);
+                    setupCall(
+                      peer.call(pl.new.peer_id, stream),
+                      pl.new.peer_id
+                    );
                   }
                 }
               )
@@ -400,27 +425,28 @@ export default function MeetingRoom() {
 
       loadMessagesAndReactions();
       setIsJoining(false);
-      
     } catch (err) {
       console.error("Join meeting error:", err);
       setIsJoining(false);
-      alert("🛑 Failed to join meeting. Please check your camera and microphone permissions.");
+      alert(
+        "🛑 Failed to join meeting. Please check your camera and microphone permissions."
+      );
     }
   }
 
   function setupCall(call, peerId) {
     console.log("Setting up call with:", peerId);
-    
+
     call.on("stream", (st) => {
       console.log("Received stream from:", peerId);
       addRemote(peerId, st);
     });
-    
+
     call.on("close", () => {
       console.log("Call closed with:", peerId);
       removeRemote(peerId);
     });
-    
+
     call.on("error", (err) => {
       console.error("Call error with", peerId, ":", err);
       removeRemote(peerId);
@@ -432,7 +458,7 @@ export default function MeetingRoom() {
       console.log("Remote video already exists for:", id);
       return;
     }
-    
+
     console.log("Adding remote video for:", id);
     const div = document.createElement("div");
     div.className = "relative bg-black rounded";
@@ -441,15 +467,16 @@ export default function MeetingRoom() {
     vid.autoplay = true;
     vid.playsInline = true;
     vid.className = "border bg-black w-full h-32 rounded";
-    
+
     const label = document.createElement("div");
-    label.className = "absolute top-1 left-1 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+    label.className =
+      "absolute top-1 left-1 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
     label.textContent = id.substring(0, 8);
-    
+
     div.appendChild(vid);
     div.appendChild(label);
     remoteVideosRef.current[id] = div;
-    
+
     const container = document.getElementById("remote-videos");
     if (container) {
       container.appendChild(div);
@@ -473,7 +500,7 @@ export default function MeetingRoom() {
         waitingChannel,
         participantListener,
         messagesChannel,
-        reactionsChannel
+        reactionsChannel,
       ];
 
       for (const channelRef of channels) {
@@ -490,27 +517,27 @@ export default function MeetingRoom() {
   // CLEANUP on leave/unmount
   async function leaveRoom() {
     if (!isMountedRef.current) return;
-    
+
     try {
       console.log("Leaving room...");
-      
+
       if (isRecording) await stopRecording();
-      
+
       if (peerRef.current) {
         peerRef.current.destroy();
         peerRef.current = null;
       }
-      
+
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => {
           track.stop();
         });
         localStreamRef.current = null;
       }
-      
+
       Object.values(remoteVideosRef.current).forEach((el) => el.remove());
       remoteVideosRef.current = {};
-      
+
       if (refreshInterval.current) {
         clearInterval(refreshInterval.current);
         refreshInterval.current = null;
@@ -525,12 +552,11 @@ export default function MeetingRoom() {
       }
 
       await cleanupSubscriptions();
-      
+
       setIsInitialized(false);
       setMediaPermissionGranted(false);
       setPermitToJoin(false);
       setWaitingForApproval(false);
-      
     } catch (err) {
       console.warn("Leave room error:", err);
     }
@@ -539,59 +565,71 @@ export default function MeetingRoom() {
   // WAITING LIST (host)
   function setupWaitingListener(mtId) {
     console.log("Setting up waiting listener for meeting:", mtId);
+
+    // Initial fetch
     updateWaitingList(mtId);
-    
+
     if (!waitingChannel.current) {
       waitingChannel.current = supabase
-        .channel(`waiting:${mtId}:${Date.now()}`)
+        .channel(`waiting:${mtId}`)
         .on(
           "postgres_changes",
           {
             event: "*",
             schema: "public",
             table: "participants",
-            filter: `meeting_id=eq.${mtId}`
+            filter: `meeting_id=eq.${mtId}`,
           },
-          () => updateWaitingList(mtId)
+          (payload) => {
+            console.log("Participant change detected:", payload);
+            updateWaitingList(mtId);
+          }
         )
-        .subscribe();
+        .subscribe((status) => {
+          console.log("Waiting channel subscription status:", status);
+        });
     }
   }
-
   async function updateWaitingList(mtId) {
     try {
       const { data, error } = await supabase
         .from("participants")
-        .select(`
-          user_id,
-          created_at,
-          users!inner(email, id)
-        `)
+        .select(
+          `
+        id,
+        user_id,
+        status,
+        profiles:user_id(email),
+        created_at
+      `
+        )
         .eq("meeting_id", mtId)
         .eq("status", "pending")
         .order("created_at", { ascending: true });
-      
+
       if (error) {
         console.error("Error fetching waiting list:", error);
         return;
       }
-      
+
       console.log("Updated waiting list:", data);
       setWaitingList(data || []);
     } catch (error) {
       console.error("Error in updateWaitingList:", error);
     }
   }
-
   async function approveUser(uid) {
     try {
       console.log("Approving user:", uid);
       const { error } = await supabase
         .from("participants")
-        .update({ status: "approved" })
+        .update({
+          status: "approved",
+          updated_at: new Date().toISOString(),
+        })
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
-      
+
       if (error) throw error;
       console.log("User approved successfully");
     } catch (error) {
@@ -605,10 +643,13 @@ export default function MeetingRoom() {
       console.log("Denying user:", uid);
       const { error } = await supabase
         .from("participants")
-        .update({ status: "denied" })
+        .update({
+          status: "denied",
+          updated_at: new Date().toISOString(),
+        })
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
-      
+
       if (error) throw error;
       console.log("User denied successfully");
     } catch (error) {
@@ -620,20 +661,20 @@ export default function MeetingRoom() {
   // PARTICIPANT: listen for approval/denial
   function setupParticipantListener(mtId, uid) {
     console.log("Setting up participant listener for:", mtId, uid);
-    
+
     if (!participantListener.current) {
       participantListener.current = supabase
-        .channel(`participants:${mtId}:${uid}:${Date.now()}`)
+        .channel(`participant:${mtId}:${uid}`)
         .on(
           "postgres_changes",
           {
             event: "UPDATE",
             schema: "public",
             table: "participants",
-            filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`
+            filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
           },
           async (payload) => {
-            console.log("Participant status change received:", payload.new);
+            console.log("Participant status update:", payload.new);
             if (payload.new.status === "approved") {
               setWaitingForApproval(false);
               setPermitToJoin(true);
@@ -652,7 +693,9 @@ export default function MeetingRoom() {
             }
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          console.log("Participant listener subscription status:", status);
+        });
     }
   }
 
@@ -689,7 +732,7 @@ export default function MeetingRoom() {
               event: "INSERT",
               schema: "public",
               table: "messages",
-              filter: `room_id=eq.${roomId}`
+              filter: `room_id=eq.${roomId}`,
             },
             (pl) => setMessages((m) => [...m, pl.new])
           )
@@ -712,7 +755,7 @@ export default function MeetingRoom() {
               event: "INSERT",
               schema: "public",
               table: "reactions",
-              filter: `room_id=eq.${roomId}`
+              filter: `room_id=eq.${roomId}`,
             },
             (pl) => setReactions((r) => [...r, pl.new])
           )
@@ -730,7 +773,7 @@ export default function MeetingRoom() {
         room_id: roomId,
         sender: user.email,
         text: chatInput,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
       });
       setChatInput("");
     } catch (error) {
@@ -744,7 +787,7 @@ export default function MeetingRoom() {
         room_id: roomId,
         user_id: user.id,
         emoji,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
       });
     } catch (error) {
       console.error("Error sending reaction:", error);
@@ -754,19 +797,21 @@ export default function MeetingRoom() {
   // Manual request to join (for non-host users)
   async function requestToJoin() {
     if (!meetingDbId || !user?.id) return;
-    
+
     try {
       console.log("Requesting to join...");
-      const { error } = await supabase
-        .from("participants")
-        .upsert({
+      const { error } = await supabase.from("participants").upsert(
+        {
           meeting_id: meetingDbId,
           user_id: user.id,
-          status: "pending"
-        }, {
-          onConflict: "meeting_id,user_id"
-        });
-      
+          status: "pending",
+          created_at: new Date().toISOString(),
+        },
+        {
+          onConflict: "meeting_id,user_id",
+        }
+      );
+
       if (error) throw error;
       console.log("Join request sent successfully");
       setWaitingForApproval(true);
@@ -776,7 +821,6 @@ export default function MeetingRoom() {
       alert("Failed to send request. Please try again.");
     }
   }
-
   // UI render
   if (needPasscode) {
     return (
@@ -838,7 +882,9 @@ export default function MeetingRoom() {
                 className="flex items-center gap-3 p-3 bg-white rounded-lg border shadow-sm"
               >
                 <div className="flex-1">
-                  <p className="font-medium">{w.users.email}</p>
+                  <p className="font-medium">
+                    {w.profiles?.email || "Unknown user"}
+                  </p>
                   <p className="text-sm text-gray-500">
                     Requested at: {new Date(w.created_at).toLocaleTimeString()}
                   </p>
@@ -849,7 +895,7 @@ export default function MeetingRoom() {
                 >
                   ✅ Approve
                 </button>
-                <button 
+                <button
                   onClick={() => denyUser(w.user_id)}
                   className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 font-medium"
                 >
@@ -864,24 +910,26 @@ export default function MeetingRoom() {
       {/* Status Display */}
       <div className="bg-gray-50 border rounded-lg p-4">
         <div className="flex items-center gap-4 text-sm">
-          <span className={`px-3 py-1 rounded-full font-medium ${
-            isHost ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-800'
-          }`}>
-            {isHost ? '👑 Host' : '👤 Participant'}
+          <span
+            className={`px-3 py-1 rounded-full font-medium ${
+              isHost ? "bg-blue-100 text-blue-800" : "bg-gray-100 text-gray-800"
+            }`}
+          >
+            {isHost ? "👑 Host" : "👤 Participant"}
           </span>
-          
+
           {waitingForApproval && (
             <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full font-medium">
               ⏳ Waiting for host approval...
             </span>
           )}
-          
+
           {permitToJoin && mediaPermissionGranted && (
             <span className="px-3 py-1 bg-green-100 text-green-800 rounded-full font-medium">
               ✅ Connected
             </span>
           )}
-          
+
           {isRecording && (
             <span className="px-3 py-1 bg-red-100 text-red-800 rounded-full font-medium animate-pulse">
               🔴 Recording
@@ -902,7 +950,7 @@ export default function MeetingRoom() {
             disabled={isJoining}
             className="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {isJoining ? '⏳ Requesting...' : '🙋 Request to Join Meeting'}
+            {isJoining ? "⏳ Requesting..." : "🙋 Request to Join Meeting"}
           </button>
         </div>
       )}
@@ -923,13 +971,13 @@ export default function MeetingRoom() {
                   className="w-full h-64 lg:h-96 object-cover"
                 />
                 <div className="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-sm px-2 py-1 rounded">
-                  You {isMuted ? '🔇' : '🎤'} {cameraOn ? '📹' : '📹❌'}
+                  You {isMuted ? "🔇" : "🎤"} {cameraOn ? "📹" : "📹❌"}
                 </div>
               </div>
-              
+
               {/* Remote Videos */}
-              <div 
-                id="remote-videos" 
+              <div
+                id="remote-videos"
                 className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 mt-4"
               />
             </div>
@@ -941,7 +989,9 @@ export default function MeetingRoom() {
                   <button
                     onClick={() => setShowChat(true)}
                     className={`flex-1 p-3 font-medium ${
-                      showChat ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'
+                      showChat
+                        ? "bg-blue-50 text-blue-600 border-b-2 border-blue-600"
+                        : "text-gray-600"
                     }`}
                   >
                     💬 Chat
@@ -949,7 +999,9 @@ export default function MeetingRoom() {
                   <button
                     onClick={() => setShowChat(false)}
                     className={`flex-1 p-3 font-medium ${
-                      !showChat ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'
+                      !showChat
+                        ? "bg-blue-50 text-blue-600 border-b-2 border-blue-600"
+                        : "text-gray-600"
                     }`}
                   >
                     😊 Reactions
@@ -962,7 +1014,9 @@ export default function MeetingRoom() {
                     <div className="flex-1 overflow-y-auto p-3 space-y-2">
                       {messages.map((msg, idx) => (
                         <div key={idx} className="text-sm">
-                          <div className="font-medium text-blue-600">{msg.sender}</div>
+                          <div className="font-medium text-blue-600">
+                            {msg.sender}
+                          </div>
                           <div className="text-gray-800">{msg.text}</div>
                           <div className="text-xs text-gray-500">
                             {new Date(msg.created_at).toLocaleTimeString()}
@@ -970,7 +1024,7 @@ export default function MeetingRoom() {
                         </div>
                       ))}
                     </div>
-                    
+
                     {/* Chat Input */}
                     <div className="p-3 border-t">
                       <div className="flex gap-2">
@@ -995,7 +1049,10 @@ export default function MeetingRoom() {
                     {/* Reactions Display */}
                     <div className="flex-1 overflow-y-auto p-3 space-y-1">
                       {reactions.slice(-20).map((reaction, idx) => (
-                        <div key={idx} className="text-sm flex items-center gap-2">
+                        <div
+                          key={idx}
+                          className="text-sm flex items-center gap-2"
+                        >
                           <span className="text-2xl">{reaction.emoji}</span>
                           <span className="text-xs text-gray-500">
                             {new Date(reaction.created_at).toLocaleTimeString()}
@@ -1003,19 +1060,21 @@ export default function MeetingRoom() {
                         </div>
                       ))}
                     </div>
-                    
+
                     {/* Reaction Buttons */}
                     <div className="p-3 border-t">
                       <div className="grid grid-cols-4 gap-2">
-                        {['👍', '❤️', '😂', '😮', '😢', '👏', '🔥', '🎉'].map((emoji) => (
-                          <button
-                            key={emoji}
-                            onClick={() => sendReaction(emoji)}
-                            className="p-2 text-2xl hover:bg-gray-100 rounded-lg transition-colors"
-                          >
-                            {emoji}
-                          </button>
-                        ))}
+                        {["👍", "❤️", "😂", "😮", "😢", "👏", "🔥", "🎉"].map(
+                          (emoji) => (
+                            <button
+                              key={emoji}
+                              onClick={() => sendReaction(emoji)}
+                              className="p-2 text-2xl hover:bg-gray-100 rounded-lg transition-colors"
+                            >
+                              {emoji}
+                            </button>
+                          )
+                        )}
                       </div>
                     </div>
                   </>
@@ -1031,44 +1090,48 @@ export default function MeetingRoom() {
               <button
                 onClick={toggleMute}
                 className={`p-3 rounded-full font-medium transition-colors ${
-                  isMuted 
-                    ? 'bg-red-500 hover:bg-red-600 text-white' 
-                    : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                  isMuted
+                    ? "bg-red-500 hover:bg-red-600 text-white"
+                    : "bg-gray-200 hover:bg-gray-300 text-gray-700"
                 }`}
               >
-                {isMuted ? '🔇' : '🎤'}
+                {isMuted ? "🔇" : "🎤"}
               </button>
 
               {/* Camera Button */}
               <button
                 onClick={toggleCamera}
                 className={`p-3 rounded-full font-medium transition-colors ${
-                  !cameraOn 
-                    ? 'bg-red-500 hover:bg-red-600 text-white' 
-                    : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                  !cameraOn
+                    ? "bg-red-500 hover:bg-red-600 text-white"
+                    : "bg-gray-200 hover:bg-gray-300 text-gray-700"
                 }`}
               >
-                {cameraOn ? '📹' : '📹❌'}
+                {cameraOn ? "📹" : "📹❌"}
               </button>
 
               {/* Recording Button */}
               <button
                 onClick={isRecording ? stopRecording : startRecording}
                 className={`px-4 py-3 rounded-full font-medium transition-colors ${
-                  isRecording 
-                    ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse' 
-                    : 'bg-blue-500 hover:bg-blue-600 text-white'
+                  isRecording
+                    ? "bg-red-500 hover:bg-red-600 text-white animate-pulse"
+                    : "bg-blue-500 hover:bg-blue-600 text-white"
                 }`}
               >
-                {isRecording ? '⏹️ Stop Recording' : '🔴 Start Recording'}
+                {isRecording ? "⏹️ Stop Recording" : "🔴 Start Recording"}
               </button>
 
               {/* Leave Button */}
               <button
                 onClick={() => {
-                  if (window.confirm('Are you sure you want to leave the meeting?')) {
+                  if (
+                    window.confirm(
+                      "Are you sure you want to leave the meeting?"
+                    )
+                  ) {
                     leaveRoom();
-                    navigate('/');
+                    navigate("/");
                   }
                 }}
                 className="px-4 py-3 bg-red-500 hover:bg-red-600 text-white rounded-full font-medium transition-colors"
@@ -1081,10 +1144,12 @@ export default function MeetingRoom() {
           {/* Meeting Info */}
           <div className="bg-gray-50 rounded-lg p-4 text-center text-sm text-gray-600">
             <p>
-              Meeting ID: <span className="font-mono font-bold">{roomId}</span> | 
-              Participants: <span className="font-bold">{participants.length + 1}</span> |
-              Status: <span className="font-bold">
-                {mediaPermissionGranted ? 'Connected' : 'Connecting...'}
+              Meeting ID: <span className="font-mono font-bold">{roomId}</span>{" "}
+              | Participants:{" "}
+              <span className="font-bold">{participants.length + 1}</span> |
+              Status:{" "}
+              <span className="font-bold">
+                {mediaPermissionGranted ? "Connected" : "Connecting..."}
               </span>
             </p>
           </div>
