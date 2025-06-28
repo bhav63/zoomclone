@@ -32,6 +32,9 @@ export default function MeetingRoom() {
   const [showChat, setShowChat] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState("Connecting...");
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [participantNames, setParticipantNames] = useState({});
+  const [activeSpeakers, setActiveSpeakers] = useState({});
+  const [connectionStats, setConnectionStats] = useState({});
 
   // Refs
   const peerRef = useRef();
@@ -43,6 +46,10 @@ export default function MeetingRoom() {
   const refreshInterval = useRef();
   const isMountedRef = useRef(true);
   const retryCountsRef = useRef({});
+  const audioContextRef = useRef();
+  const analysersRef = useRef({});
+  const peerConnectionsRef = useRef({});
+  const statsIntervalRef = useRef();
 
   // Supabase channels
   const waitingChannel = useRef();
@@ -50,6 +57,7 @@ export default function MeetingRoom() {
   const signalsChannel = useRef();
   const messagesChannel = useRef();
   const reactionsChannel = useRef();
+  const participantsChannel = useRef();
 
   const BASE_URL = "https://zoomclone-v3.vercel.app";
   const shareLink = `${BASE_URL}/room/${roomId}${
@@ -95,422 +103,139 @@ export default function MeetingRoom() {
     }
   }
 
-  // Media functions
-  async function requestMediaPermissions() {
-    if (localStreamRef.current) {
-      return localStreamRef.current;
-    }
+  function setupWaitingListener(mtId) {
+    console.log("Setting up waiting listener for meeting:", mtId);
 
-    try {
-      console.log("Requesting media permissions...");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: true,
-      });
+    updateWaitingList(mtId);
 
-      localStreamRef.current = stream;
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-
-      stream.getAudioTracks().forEach((track) => (track.enabled = true));
-      stream.getVideoTracks().forEach((track) => (track.enabled = true));
-
-      setIsMuted(false);
-      setCameraOn(true);
-      setMediaPermissionGranted(true);
-      console.log("Media permissions granted");
-      return stream;
-    } catch (err) {
-      console.error("Media permission error:", err);
-      alert("🛑 Please allow camera & mic access to join the meeting.");
-      throw err;
-    }
-  }
-
-  async function toggleScreenShare() {
-    try {
-      if (isScreenSharing) {
-        // Stop screen sharing
-        if (screenStreamRef.current) {
-          screenStreamRef.current.getTracks().forEach(track => track.stop());
-          screenStreamRef.current = null;
-        }
-        
-        // Switch back to camera
-        if (localStreamRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current;
-          // Update all peer connections with the camera stream
-          if (peerRef.current) {
-            Object.keys(peerRef.current.connections).forEach(peerId => {
-              peerRef.current.connections[peerId].forEach(connection => {
-                if (connection.peerConnection && connection.peerConnection.getSenders) {
-                  const videoSender = connection.peerConnection.getSenders().find(s => 
-                    s.track && s.track.kind === 'video'
-                  );
-                  const audioSender = connection.peerConnection.getSenders().find(s => 
-                    s.track && s.track.kind === 'audio'
-                  );
-                  if (videoSender && localStreamRef.current) {
-                    videoSender.replaceTrack(localStreamRef.current.getVideoTracks()[0])
-                      .catch(err => console.error("Error replacing video track:", err));
-                  }
-                  if (audioSender && localStreamRef.current) {
-                    audioSender.replaceTrack(localStreamRef.current.getAudioTracks()[0])
-                      .catch(err => console.error("Error replacing audio track:", err));
-                  }
-                }
-              });
-            });
-          }
-        }
-        
-        setIsScreenSharing(false);
-      } else {
-        // Start screen sharing
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            cursor: "always",
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-            frameRate: { ideal: 30 }
+    if (!waitingChannel.current) {
+      waitingChannel.current = supabase
+        .channel(`waiting:${mtId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "participants",
+            filter: `meeting_id=eq.${mtId}`,
           },
-          audio: true
-        });
-
-        screenStreamRef.current = screenStream;
-        localVideoRef.current.srcObject = screenStream;
-        setIsScreenSharing(true);
-
-        // Handle when user stops sharing via browser UI
-        screenStream.getVideoTracks()[0].onended = () => {
-          if (localStreamRef.current) {
-            localVideoRef.current.srcObject = localStreamRef.current;
+          (payload) => {
+            console.log("Participant change detected:", payload);
+            updateWaitingList(mtId);
           }
-          setIsScreenSharing(false);
-        };
+        )
+        .subscribe((status) => {
+          console.log("Waiting channel subscription status:", status);
+        });
+    }
+  }
 
-        // Replace the stream for all existing connections
-        if (peerRef.current) {
-          Object.keys(peerRef.current.connections).forEach(peerId => {
-            peerRef.current.connections[peerId].forEach(connection => {
-              if (connection.peerConnection && connection.peerConnection.getSenders) {
-                const videoSender = connection.peerConnection.getSenders().find(s => 
-                  s.track && s.track.kind === 'video'
-                );
-                const audioSender = connection.peerConnection.getSenders().find(s => 
-                  s.track && s.track.kind === 'audio'
-                );
-                if (videoSender) {
-                  videoSender.replaceTrack(screenStream.getVideoTracks()[0])
-                    .catch(err => console.error("Error replacing video track:", err));
-                }
-                if (audioSender) {
-                  const audioTrack = screenStream.getAudioTracks()[0];
-                  if (audioTrack) {
-                    audioSender.replaceTrack(audioTrack)
-                      .catch(err => console.error("Error replacing audio track:", err));
+  function setupParticipantListener(mtId, uid) {
+    console.log("Setting up participant listener for:", mtId, uid);
+
+    if (!participantListener.current) {
+      participantListener.current = supabase
+        .channel(`participant:${mtId}:${uid}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "participants",
+            filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
+          },
+          async (payload) => {
+            console.log("Participant status update:", payload.new);
+            if (payload.new.status === "approved") {
+              setWaitingForApproval(false);
+              setPermitToJoin(true);
+              alert("✅ Approved! Joining meeting...");
+              try {
+                await requestMediaPermissions();
+                await joinMeeting(mtId, uid);
+                
+                if (peerRef.current?.id) {
+                  const { data: others } = await supabase
+                    .from("signals")
+                    .select("peer_id")
+                    .eq("room_id", roomId)
+                    .neq("peer_id", peerRef.current.id);
+
+                  if (others && others.length > 0) {
+                    others.forEach(({ peer_id }) => {
+                      connectToPeer(peer_id);
+                    });
                   }
                 }
+              } catch (err) {
+                console.error("Error joining after approval:", err);
+                alert("Failed to join meeting. Please refresh and try again.");
               }
-            });
-          });
-        }
-      }
-    } catch (err) {
-      console.error("Screen share error:", err);
-      if (localStreamRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current;
-      }
-      setIsScreenSharing(false);
-    }
-  }
-
-  function toggleMute() {
-    if (localStreamRef.current) {
-      const audioTracks = localStreamRef.current.getAudioTracks();
-      audioTracks.forEach((track) => {
-        track.enabled = !track.enabled;
-      });
-      setIsMuted(!isMuted);
-    }
-  }
-
-  function toggleCamera() {
-    if (localStreamRef.current) {
-      const videoTracks = localStreamRef.current.getVideoTracks();
-      videoTracks.forEach((track) => {
-        track.enabled = !track.enabled;
-      });
-      setCameraOn(!cameraOn);
-    }
-  }
-
-  async function startRecording() {
-    if (!localStreamRef.current) {
-      alert("Please join the meeting first to start recording.");
-      return;
-    }
-    try {
-      // Combine audio and video streams
-      const combinedStream = new MediaStream();
-      localStreamRef.current.getAudioTracks().forEach(track => combinedStream.addTrack(track));
-      
-      // Use screen share if available, otherwise use camera
-      const videoSource = isScreenSharing && screenStreamRef.current ? 
-        screenStreamRef.current : 
-        localStreamRef.current;
-      
-      videoSource.getVideoTracks().forEach(track => combinedStream.addTrack(track));
-
-      const recorder = new RecordRTC(combinedStream, {
-        type: "video",
-        mimeType: "video/webm;codecs=vp9",
-        bitsPerSecond: 1280000,
-        videoBitsPerSecond: 1000000,
-        audioBitsPerSecond: 128000
-      });
-      
-      recorder.startRecording();
-      recorderRef.current = recorder;
-      setIsRecording(true);
-      alert("🔴 Recording started!");
-    } catch (err) {
-      console.error("Recording start error:", err);
-      alert("Failed to start recording.");
-    }
-  }
-
-  async function stopRecording() {
-    if (!recorderRef.current) return;
-    try {
-      // Stop recording
-      await new Promise((resolve) => {
-        recorderRef.current.stopRecording(resolve);
-      });
-      
-      // Get the recorded blob
-      const blob = recorderRef.current.getBlob();
-      
-      // Generate filename with timestamp
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `recording-${roomId}-${timestamp}.webm`;
-      
-      // Upload to Supabase Storage
-      const { data, error } = await supabase.storage
-        .from("recordings")
-        .upload(`public/${filename}`, blob, {
-          contentType: 'video/webm',
-          upsert: false
+            } else if (payload.new.status === "denied") {
+              setWaitingForApproval(false);
+              alert("⛔ Access denied by host.");
+              navigate("/");
+            }
+          }
+        )
+        .subscribe((status) => {
+          console.log("Participant listener subscription status:", status);
         });
-      
-      if (error) {
-        console.error("Upload error:", error);
-        alert("Failed to upload recording.");
-        return;
-      }
-      
-      // Get public URL
-      const { data: { publicUrl } } = supabase.storage
-        .from("recordings")
-        .getPublicUrl(`public/${filename}`);
-      
-      // Insert recording metadata into database
-      const { data: userData } = await supabase.auth.getUser();
-      await supabase.from("recordings").insert({
-        room_id: roomId,
-        uploaded_by: userData.user.id,
-        file_name: filename,
-        file_url: publicUrl,
-        file_size: blob.size,
-        duration: Math.floor(recorderRef.current.getBlob().duration),
-        created_at: new Date().toISOString()
-      });
-      
-      alert("✅ Recording saved and uploaded successfully!");
-      setIsRecording(false);
-      recorderRef.current = null;
-    } catch (err) {
-      console.error("Recording stop error:", err);
-      setIsRecording(false);
-      recorderRef.current = null;
-      alert("Failed to save recording. Please try again.");
     }
   }
 
-  // PeerJS functions
-  const createPeer = () => {
-    const peer = new Peer({
-      debug: 2,
-      config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-          { urls: "stun:stun2.l.google.com:19302" },
-        ],
-        iceTransportPolicy: "all",
-        iceCandidatePoolSize: 3,
-      },
-    });
-
-    peer.on("error", (err) => {
-      console.error("PeerJS error:", err);
-      setConnectionStatus(`Error: ${err.type}`);
-
-      if (err.type === "peer-unavailable") {
-        console.warn("Peer unavailable, will retry...");
-      } else if (err.type === "socket-error") {
-        console.error("Socket error, attempting to reconnect...");
-        setTimeout(() => {
-          if (isMountedRef.current && peerRef.current?.disconnected) {
-            peerRef.current.reconnect();
+  function setupParticipantsListener(mtId) {
+    if (!participantsChannel.current) {
+      participantsChannel.current = supabase
+        .channel(`participants:${mtId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "participants",
+            filter: `meeting_id=eq.${mtId}`,
+          },
+          (payload) => {
+            console.log("Participants change detected:", payload);
+            updateParticipants(mtId);
           }
-        }, 2000);
-      }
-    });
+        )
+        .subscribe((status) => {
+          console.log("Participants channel subscription status:", status);
+        });
+    }
+  }
 
-    peer.on("iceConnectionStateChange", (state) => {
-      console.log("ICE connection state:", state);
-      setConnectionStatus(state.charAt(0).toUpperCase() + state.slice(1));
-
-      if (state === "failed") {
-        console.warn("ICE connection failed, attempting recovery...");
-        setTimeout(() => {
-          if (isMountedRef.current) {
-            reconnectPeers();
-          }
-        }, 2000);
-      }
-    });
-
-    return peer;
-  };
-
-  const reconnectPeers = async () => {
-    if (!peerRef.current || !peerRef.current.id) return;
-
+  async function updateParticipants(mtId) {
     try {
-      const { data: others } = await supabase
-        .from("signals")
-        .select("peer_id")
-        .eq("room_id", roomId)
-        .neq("peer_id", peerRef.current.id);
-
-      if (others && others.length > 0) {
-        others.forEach(({ peer_id }) => {
-          connectToPeer(peer_id);
+      const { data } = await supabase
+        .from("participants")
+        .select("user_id, profiles:user_id(email)")
+        .eq("meeting_id", mtId)
+        .eq("status", "approved");
+      
+      if (data) {
+        setParticipants(data.map((p) => p.user_id));
+        
+        const names = {};
+        data.forEach(p => {
+          names[p.user_id] = p.profiles?.email || p.user_id.substring(0, 8);
+        });
+        setParticipantNames(names);
+        
+        Object.keys(remoteVideosRef.current).forEach(peerId => {
+          const label = remoteVideosRef.current[peerId].querySelector('div');
+          if (label) {
+            label.textContent = names[peerId] || peerId.substring(0, 8);
+          }
         });
       }
     } catch (error) {
-      console.error("Reconnection error:", error);
-    }
-  };
-
-  const connectToPeer = async (peerId) => {
-    if (!peerRef.current || !localStreamRef.current) return;
-
-    if (peerRef.current.connections[peerId]?.length > 0) return;
-
-    if (!retryCountsRef.current[peerId]) {
-      retryCountsRef.current[peerId] = 0;
-    }
-
-    if (retryCountsRef.current[peerId] >= 5) {
-      console.warn(`Max retries reached for peer ${peerId}`);
-      return;
-    }
-
-    try {
-      console.log(
-        `Connecting to peer: ${peerId}, attempt: ${
-          retryCountsRef.current[peerId] + 1
-        }`
-      );
-
-      const streamToSend = isScreenSharing && screenStreamRef.current ? 
-        screenStreamRef.current : 
-        localStreamRef.current;
-
-      const call = peerRef.current.call(peerId, streamToSend);
-      setupCall(call, peerId);
-
-      retryCountsRef.current[peerId] = 0;
-    } catch (err) {
-      console.error(`Connection attempt failed to ${peerId}:`, err);
-      retryCountsRef.current[peerId] += 1;
-
-      const delay = Math.min(
-        1000 * Math.pow(2, retryCountsRef.current[peerId]),
-        8000
-      );
-      setTimeout(() => connectToPeer(peerId), delay);
-    }
-  };
-
-  const setupCall = (call, peerId) => {
-    call.on("stream", (remoteStream) => {
-      console.log("Received stream from:", peerId);
-      addRemote(peerId, remoteStream);
-      setConnectionStatus("Connected");
-    });
-
-    call.on("close", () => {
-      console.log("Call closed with:", peerId);
-      removeRemote(peerId);
-      setConnectionStatus("Disconnected");
-    });
-
-    call.on("error", (err) => {
-      console.error("Call error with", peerId, ":", err);
-      removeRemote(peerId);
-      setConnectionStatus("Error: " + err.message);
-    });
-
-    call.on("iceStateChanged", (state) => {
-      console.log(`ICE state with ${peerId}:`, state);
-      if (state === "disconnected" || state === "failed") {
-        console.warn(
-          `Connection to ${peerId} is ${state}, attempting recovery`
-        );
-        setTimeout(() => connectToPeer(peerId), 2000);
-      }
-    });
-  };
-
-  function addRemote(id, stream) {
-    if (remoteVideosRef.current[id]) return;
-
-    const div = document.createElement("div");
-    div.className = "relative bg-black rounded";
-    const vid = document.createElement("video");
-    vid.srcObject = stream;
-    vid.autoplay = true;
-    vid.playsInline = true;
-    vid.className = "border bg-black w-full h-32 rounded";
-
-    const label = document.createElement("div");
-    label.className =
-      "absolute top-1 left-1 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
-    label.textContent = id.substring(0, 8);
-
-    div.appendChild(vid);
-    div.appendChild(label);
-    remoteVideosRef.current[id] = div;
-
-    const container = document.getElementById("remote-videos");
-    if (container) container.appendChild(div);
-  }
-
-  function removeRemote(id) {
-    const el = remoteVideosRef.current[id];
-    if (el) {
-      el.remove();
-      delete remoteVideosRef.current[id];
+      console.error("Error updating participants:", error);
     }
   }
 
-  // Database functions
   async function updateWaitingList(mtId) {
     try {
       const { data, error } = await supabase
@@ -540,123 +265,658 @@ export default function MeetingRoom() {
     }
   }
 
-  function setupWaitingListener(mtId) {
-    console.log("Setting up waiting listener for meeting:", mtId);
+  // Enhanced media functions with error handling
+  async function requestMediaPermissions() {
+    if (localStreamRef.current) {
+      return localStreamRef.current;
+    }
 
-    updateWaitingList(mtId);
+    try {
+      console.log("Requesting media permissions...");
+      const constraints = {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        },
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+        }
+      };
 
-    if (!waitingChannel.current) {
-      waitingChannel.current = supabase
-        .channel(`waiting:${mtId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId}`,
-          },
-          (payload) => {
-            console.log("Participant change detected:", payload);
-            updateWaitingList(mtId);
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      // Handle cases where browser might return stream without tracks
+      if (!stream.getAudioTracks().length && !stream.getVideoTracks().length) {
+        throw new Error("No media tracks received");
+      }
+
+      localStreamRef.current = stream;
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      stream.getAudioTracks().forEach((track) => (track.enabled = !isMuted));
+      stream.getVideoTracks().forEach((track) => (track.enabled = cameraOn));
+
+      setMediaPermissionGranted(true);
+      console.log("Media permissions granted");
+      
+      setupAudioContext(stream);
+      
+      return stream;
+    } catch (err) {
+      console.error("Media permission error:", err);
+      
+      // Try fallback constraints if the ideal ones fail
+      if (err.name === 'OverconstrainedError' || err.name === 'ConstraintNotSatisfiedError') {
+        try {
+          console.log("Trying fallback media constraints...");
+          const fallbackStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true
+          });
+          
+          localStreamRef.current = fallbackStream;
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = fallbackStream;
           }
-        )
-        .subscribe((status) => {
-          console.log("Waiting channel subscription status:", status);
-        });
+          
+          setMediaPermissionGranted(true);
+          return fallbackStream;
+        } catch (fallbackError) {
+          console.error("Fallback media error:", fallbackError);
+          throw fallbackError;
+        }
+      }
+      
+      alert("🛑 Please allow camera & mic access to join the meeting.");
+      throw err;
     }
   }
 
-  async function approveUser(uid) {
+  function setupAudioContext(stream) {
     try {
-      console.log("Approving user:", uid);
-      const { error } = await supabase
-        .from("participants")
-        .update({
-          status: "approved",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", uid);
-
-      if (error) throw error;
-      console.log("User approved successfully");
-    } catch (error) {
-      console.error("Error approving user:", error);
-      alert("Failed to approve user. Please try again.");
+      if (!audioContextRef.current) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        audioContextRef.current = new AudioContext();
+      }
+      
+      const audioContext = audioContextRef.current;
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      
+      analysersRef.current['local'] = analyser;
+      
+      analyzeAudio();
+    } catch (err) {
+      console.error("Audio context setup error:", err);
     }
   }
 
-  async function denyUser(uid) {
+  function analyzeAudio() {
+    if (!isMountedRef.current) return;
+    
+    const bufferLength = analysersRef.current['local']?.frequencyBinCount || 0;
+    const dataArray = new Uint8Array(bufferLength);
+    const newActiveSpeakers = {...activeSpeakers};
+    
+    // Analyze local audio
+    if (analysersRef.current['local']) {
+      analysersRef.current['local'].getByteFrequencyData(dataArray);
+      const volume = Math.max(...dataArray);
+      newActiveSpeakers['local'] = volume > 30;
+    }
+    
+    // Analyze remote audio
+    Object.keys(analysersRef.current).forEach(peerId => {
+      if (peerId !== 'local') {
+        analysersRef.current[peerId].getByteFrequencyData(dataArray);
+        const volume = Math.max(...dataArray);
+        newActiveSpeakers[peerId] = volume > 30;
+      }
+    });
+    
+    setActiveSpeakers(newActiveSpeakers);
+    requestAnimationFrame(analyzeAudio);
+  }
+
+  // Enhanced screen sharing with aspect ratio preservation
+  async function toggleScreenShare() {
     try {
-      console.log("Denying user:", uid);
-      const { error } = await supabase
-        .from("participants")
-        .update({
-          status: "denied",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", uid);
-
-      if (error) throw error;
-      console.log("User denied successfully");
-    } catch (error) {
-      console.error("Error denying user:", error);
-      alert("Failed to deny user. Please try again.");
-    }
-  }
-
-  function setupParticipantListener(mtId, uid) {
-    console.log("Setting up participant listener for:", mtId, uid);
-
-    if (!participantListener.current) {
-      participantListener.current = supabase
-        .channel(`participant:${mtId}:${uid}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "UPDATE",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
+      if (isScreenSharing) {
+        // Stop screen sharing
+        if (screenStreamRef.current) {
+          screenStreamRef.current.getTracks().forEach(track => track.stop());
+          screenStreamRef.current = null;
+        }
+        
+        // Switch back to camera
+        if (localStreamRef.current) {
+          localVideoRef.current.srcObject = localStreamRef.current;
+          
+          // Update all peer connections with the camera stream
+          updateAllPeerConnections(localStreamRef.current);
+        }
+        
+        setIsScreenSharing(false);
+      } else {
+        // Start screen sharing with better constraints
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            cursor: "always",
+            width: { ideal: 1920, max: 1920 },
+            height: { ideal: 1080, max: 1080 },
+            frameRate: { ideal: 30, max: 30 },
+            resizeMode: "crop-and-scale" // Preserve aspect ratio
           },
-          async (payload) => {
-            console.log("Participant status update:", payload.new);
-            if (payload.new.status === "approved") {
-              setWaitingForApproval(false);
-              setPermitToJoin(true);
-              alert("✅ Approved! Joining meeting...");
-              try {
-                await requestMediaPermissions();
-                await joinMeeting(mtId, uid);
-              } catch (err) {
-                console.error("Error joining after approval:", err);
-                alert("Failed to join meeting. Please refresh and try again.");
-              }
-            } else if (payload.new.status === "denied") {
-              setWaitingForApproval(false);
-              alert("⛔ Access denied by host.");
-              navigate("/");
+          audio: false
+        });
+
+        screenStreamRef.current = screenStream;
+        
+        // Combine with audio from local stream
+        const combinedStream = new MediaStream([
+          ...screenStream.getVideoTracks(),
+          ...(localStreamRef.current?.getAudioTracks() || [])
+        ]);
+        
+        localVideoRef.current.srcObject = combinedStream;
+        setIsScreenSharing(true);
+
+        // Handle when user stops sharing via browser UI
+        screenStream.getVideoTracks()[0].onended = () => {
+          if (localStreamRef.current) {
+            localVideoRef.current.srcObject = localStreamRef.current;
+          }
+          setIsScreenSharing(false);
+        };
+
+        // Update all peer connections with the screen share stream
+        updateAllPeerConnections(combinedStream);
+      }
+    } catch (err) {
+      console.error("Screen share error:", err);
+      if (localStreamRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current;
+      }
+      setIsScreenSharing(false);
+    }
+  }
+
+  function updateAllPeerConnections(stream) {
+    if (!peerRef.current) return;
+
+    Object.keys(peerRef.current.connections).forEach(peerId => {
+      peerRef.current.connections[peerId].forEach(connection => {
+        if (connection.peerConnection && connection.peerConnection.getSenders) {
+          const senders = connection.peerConnection.getSenders();
+          const videoTrack = stream.getVideoTracks()[0];
+          const audioTrack = stream.getAudioTracks()[0];
+          
+          senders.forEach(sender => {
+            if (sender.track.kind === 'video' && videoTrack) {
+              sender.replaceTrack(videoTrack)
+                .catch(err => console.error("Error replacing video track:", err));
+            } else if (sender.track.kind === 'audio' && audioTrack) {
+              sender.replaceTrack(audioTrack)
+                .catch(err => console.error("Error replacing audio track:", err));
             }
-          }
-        )
-        .subscribe((status) => {
-          console.log("Participant listener subscription status:", status);
-        });
+          });
+        }
+      });
+    });
+  }
+
+  function toggleMute() {
+    if (localStreamRef.current) {
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      const newMuteState = !isMuted;
+      audioTracks.forEach((track) => {
+        track.enabled = newMuteState;
+      });
+      setIsMuted(newMuteState);
     }
   }
 
-  async function updateParticipants(mtId) {
+  function toggleCamera() {
+    if (localStreamRef.current) {
+      const videoTracks = localStreamRef.current.getVideoTracks();
+      const newCameraState = !cameraOn;
+      videoTracks.forEach((track) => {
+        track.enabled = newCameraState;
+      });
+      setCameraOn(newCameraState);
+    }
+  }
+
+  async function startRecording() {
+    if (!localStreamRef.current) {
+      alert("Please join the meeting first to start recording.");
+      return;
+    }
     try {
-      const { data } = await supabase
-        .from("participants")
-        .select("user_id")
-        .eq("meeting_id", mtId)
-        .eq("status", "approved");
-      setParticipants(data?.map((p) => p.user_id) || []);
+      const combinedStream = new MediaStream();
+      
+      const videoSource = isScreenSharing && screenStreamRef.current ? 
+        screenStreamRef.current.getVideoTracks()[0] : 
+        localStreamRef.current.getVideoTracks()[0];
+      
+      const audioSource = localStreamRef.current.getAudioTracks()[0];
+      
+      if (videoSource) combinedStream.addTrack(videoSource);
+      if (audioSource) combinedStream.addTrack(audioSource);
+
+      const recorder = new RecordRTC(combinedStream, {
+        type: "video",
+        mimeType: "video/webm;codecs=vp9",
+        bitsPerSecond: 1280000,
+        videoBitsPerSecond: 1000000,
+        audioBitsPerSecond: 128000
+      });
+      
+      recorder.startRecording();
+      recorderRef.current = recorder;
+      setIsRecording(true);
+      alert("🔴 Recording started!");
+    } catch (err) {
+      console.error("Recording start error:", err);
+      alert("Failed to start recording.");
+    }
+  }
+
+  async function stopRecording() {
+    if (!recorderRef.current) return;
+    try {
+      await new Promise((resolve) => {
+        recorderRef.current.stopRecording(resolve);
+      });
+      
+      const blob = recorderRef.current.getBlob();
+      
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `recording-${roomId}-${timestamp}.webm`;
+      
+      const { data, error } = await supabase.storage
+        .from("recordings")
+        .upload(`public/${filename}`, blob, {
+          contentType: 'video/webm',
+          upsert: false
+        });
+      
+      if (error) {
+        console.error("Upload error:", error);
+        alert("Failed to upload recording.");
+        return;
+      }
+      
+      const { data: { publicUrl } } = supabase.storage
+        .from("recordings")
+        .getPublicUrl(`public/${filename}`);
+      
+      const { data: userData } = await supabase.auth.getUser();
+      await supabase.from("recordings").insert({
+        room_id: roomId,
+        uploaded_by: userData.user.id,
+        file_name: filename,
+        file_url: publicUrl,
+        file_size: blob.size,
+        duration: Math.floor(recorderRef.current.getBlob().duration),
+        created_at: new Date().toISOString()
+      });
+      
+      alert("✅ Recording saved and uploaded successfully!");
+      setIsRecording(false);
+      recorderRef.current = null;
+    } catch (err) {
+      console.error("Recording stop error:", err);
+      setIsRecording(false);
+      recorderRef.current = null;
+      alert("Failed to save recording. Please try again.");
+    }
+  }
+
+  // Enhanced PeerJS functions with better connection handling
+  const createPeer = () => {
+    const peer = new Peer({
+      debug: 3, // More verbose logging
+      config: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun2.l.google.com:19302" },
+          {
+            urls: "turn:global.turn.twilio.com:3478?transport=udp",
+            username: "your-twilio-username",
+            credential: "your-twilio-credential"
+          }
+        ],
+        iceTransportPolicy: "all",
+        iceCandidatePoolSize: 5, // Increased pool size
+        rtcpMuxPolicy: "require", // Better for mobile
+        bundlePolicy: "max-bundle", // More efficient
+        sdpSemantics: "unified-plan" // Modern SDP
+      },
+      reconnectTimer: 5000, // Faster reconnection
+    });
+
+    peer.on("error", (err) => {
+      console.error("PeerJS error:", err);
+      setConnectionStatus(`Error: ${err.type}`);
+
+      if (err.type === "peer-unavailable") {
+        console.warn("Peer unavailable, will retry...");
+        setTimeout(() => {
+          if (isMountedRef.current && peerRef.current?.disconnected) {
+            peerRef.current.reconnect();
+          }
+        }, 2000);
+      } else if (err.type === "socket-error") {
+        console.error("Socket error, attempting to reconnect...");
+        setTimeout(() => {
+          if (isMountedRef.current && peerRef.current?.disconnected) {
+            peerRef.current.reconnect();
+          }
+        }, 2000);
+      } else if (err.type === "network") {
+        console.error("Network error, will retry...");
+        setTimeout(() => {
+          if (isMountedRef.current && peerRef.current?.disconnected) {
+            peerRef.current.reconnect();
+          }
+        }, 3000);
+      }
+    });
+
+    peer.on("iceConnectionStateChange", (state) => {
+      console.log("ICE connection state:", state);
+      setConnectionStatus(state.charAt(0).toUpperCase() + state.slice(1));
+
+      if (state === "failed") {
+        console.warn("ICE connection failed, attempting recovery...");
+        setTimeout(() => {
+          if (isMountedRef.current) {
+            reconnectPeers();
+          }
+        }, 2000);
+      } else if (state === "disconnected") {
+        console.warn("ICE connection disconnected, attempting recovery...");
+        setTimeout(() => {
+          if (isMountedRef.current) {
+            reconnectPeers();
+          }
+        }, 1000);
+      }
+    });
+
+    peer.on("connectionStateChange", (state) => {
+      console.log("Peer connection state:", state);
+      if (state === "disconnected") {
+        setTimeout(() => {
+          if (isMountedRef.current && peerRef.current?.disconnected) {
+            peerRef.current.reconnect();
+          }
+        }, 2000);
+      }
+    });
+
+    return peer;
+  };
+
+  const reconnectPeers = async () => {
+    if (!peerRef.current || !peerRef.current.id) return;
+
+    try {
+      const { data: others } = await supabase
+        .from("signals")
+        .select("peer_id, user_id")
+        .eq("room_id", roomId)
+        .neq("peer_id", peerRef.current.id);
+
+      if (others && others.length > 0) {
+        console.log("Reconnecting to peers:", others);
+        others.forEach(({ peer_id, user_id }) => {
+          // Only reconnect if we don't already have an active connection
+          if (!peerConnectionsRef.current[peer_id]) {
+            connectToPeer(peer_id);
+          }
+        });
+      }
     } catch (error) {
-      console.error("Error updating participants:", error);
+      console.error("Reconnection error:", error);
+    }
+  };
+
+  const connectToPeer = async (peerId) => {
+    if (!peerRef.current || !localStreamRef.current) return;
+
+    // Skip if already connected
+    if (peerConnectionsRef.current[peerId]) {
+      console.log(`Already connected to ${peerId}, skipping`);
+      return;
+    }
+
+    if (!retryCountsRef.current[peerId]) {
+      retryCountsRef.current[peerId] = 0;
+    }
+
+    if (retryCountsRef.current[peerId] >= 5) {
+      console.warn(`Max retries reached for peer ${peerId}`);
+      return;
+    }
+
+    try {
+      console.log(
+        `Connecting to peer: ${peerId}, attempt: ${
+          retryCountsRef.current[peerId] + 1
+        }`
+      );
+
+      const streamToSend = isScreenSharing && screenStreamRef.current ? 
+        new MediaStream([
+          ...screenStreamRef.current.getVideoTracks(),
+          ...localStreamRef.current.getAudioTracks()
+        ]) : 
+        localStreamRef.current;
+
+      const call = peerRef.current.call(peerId, streamToSend);
+      peerConnectionsRef.current[peerId] = call;
+      setupCall(call, peerId);
+
+      retryCountsRef.current[peerId] = 0;
+    } catch (err) {
+      console.error(`Connection attempt failed to ${peerId}:`, err);
+      retryCountsRef.current[peerId] += 1;
+      delete peerConnectionsRef.current[peerId];
+
+      const delay = Math.min(
+        1000 * Math.pow(2, retryCountsRef.current[peerId]),
+        8000
+      );
+      setTimeout(() => connectToPeer(peerId), delay);
+    }
+  };
+
+  const setupCall = (call, peerId) => {
+    call.on("stream", (remoteStream) => {
+      console.log("Received stream from:", peerId);
+      
+      // Setup audio analysis for remote stream
+      if (!audioContextRef.current) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        audioContextRef.current = new AudioContext();
+      }
+      
+      const analyser = audioContextRef.current.createAnalyser();
+      analyser.fftSize = 512;
+      const source = audioContextRef.current.createMediaStreamSource(remoteStream);
+      source.connect(analyser);
+      analysersRef.current[peerId] = analyser;
+      
+      addRemote(peerId, remoteStream);
+      setConnectionStatus("Connected");
+      
+      // Start connection stats monitoring
+      if (!statsIntervalRef.current) {
+        startConnectionStats();
+      }
+    });
+
+    call.on("close", () => {
+      console.log("Call closed with:", peerId);
+      removeRemote(peerId);
+      delete peerConnectionsRef.current[peerId];
+      setConnectionStatus("Disconnected");
+      
+      if (analysersRef.current[peerId]) {
+        delete analysersRef.current[peerId];
+      }
+    });
+
+    call.on("error", (err) => {
+      console.error("Call error with", peerId, ":", err);
+      removeRemote(peerId);
+      delete peerConnectionsRef.current[peerId];
+      setConnectionStatus("Error: " + err.message);
+      
+      if (analysersRef.current[peerId]) {
+        delete analysersRef.current[peerId];
+      }
+    });
+
+    call.on("iceStateChanged", (state) => {
+      console.log(`ICE state with ${peerId}:`, state);
+      if (state === "disconnected" || state === "failed") {
+        console.warn(`Connection to ${peerId} is ${state}, attempting recovery`);
+        setTimeout(() => connectToPeer(peerId), 2000);
+      }
+    });
+  };
+
+  function startConnectionStats() {
+    if (statsIntervalRef.current) return;
+
+    statsIntervalRef.current = setInterval(() => {
+      if (!peerRef.current) return;
+
+      const stats = {};
+      
+      Object.entries(peerConnectionsRef.current).forEach(([peerId, call]) => {
+        if (call.peerConnection) {
+          try {
+            call.peerConnection.getStats().then(results => {
+              results.forEach(report => {
+                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                  stats[peerId] = {
+                    rtt: report.currentRoundTripTime,
+                    packetsLost: report.packetsLost,
+                    bytesSent: report.bytesSent,
+                    bytesReceived: report.bytesReceived
+                  };
+                }
+              });
+              setConnectionStats(stats);
+            });
+          } catch (err) {
+            console.error("Error getting stats for peer", peerId, err);
+          }
+        }
+      });
+    }, 5000); // Update stats every 5 seconds
+  }
+
+  function addRemote(id, stream) {
+    if (remoteVideosRef.current[id]) return;
+
+    const div = document.createElement("div");
+    div.className = "relative bg-black rounded-lg overflow-hidden";
+    div.id = `remote-${id}`;
+    
+    const vid = document.createElement("video");
+    vid.srcObject = stream;
+    vid.autoplay = true;
+    vid.playsInline = true;
+    vid.className = "w-full h-full object-cover";
+    
+    // Add audio context for this remote stream
+    if (!audioContextRef.current) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioContextRef.current = new AudioContext();
+    }
+    
+    const analyser = audioContextRef.current.createAnalyser();
+    analyser.fftSize = 512;
+    const source = audioContextRef.current.createMediaStreamSource(stream);
+    source.connect(analyser);
+    analysersRef.current[id] = analyser;
+
+    const label = document.createElement("div");
+    label.className =
+      "absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+    label.textContent = participantNames[id] || id.substring(0, 8);
+    
+    // Add speaking indicator
+    const speakingIndicator = document.createElement("div");
+    speakingIndicator.className = "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
+    speakingIndicator.id = `speaking-${id}`;
+
+    // Add connection stats
+    const statsElement = document.createElement("div");
+    statsElement.className = "absolute top-2 left-2 bg-black bg-opacity-50 text-white text-xs px-1 rounded";
+    statsElement.id = `stats-${id}`;
+
+    div.appendChild(vid);
+    div.appendChild(label);
+    div.appendChild(speakingIndicator);
+    div.appendChild(statsElement);
+    remoteVideosRef.current[id] = div;
+
+    const container = document.getElementById("remote-videos");
+    if (container) container.appendChild(div);
+    
+    // Update UI elements periodically
+    const updateUIElements = () => {
+      if (!isMountedRef.current) return;
+      
+      // Update speaking indicator
+      const indicator = document.getElementById(`speaking-${id}`);
+      if (indicator) {
+        indicator.className = `absolute top-2 right-2 w-3 h-3 rounded-full ${
+          activeSpeakers[id] ? 'bg-green-500' : 'bg-transparent'
+        }`;
+      }
+      
+      // Update stats
+      const statsDisplay = document.getElementById(`stats-${id}`);
+      if (statsDisplay && connectionStats[id]) {
+        const { rtt, packetsLost } = connectionStats[id];
+        statsDisplay.textContent = `${Math.round(rtt * 1000)}ms ${packetsLost > 0 ? '⚠️' : ''}`;
+      }
+      
+      requestAnimationFrame(updateUIElements);
+    };
+    
+    updateUIElements();
+  }
+
+  function removeRemote(id) {
+    const el = remoteVideosRef.current[id];
+    if (el) {
+      el.remove();
+      delete remoteVideosRef.current[id];
+    }
+    
+    if (analysersRef.current[id]) {
+      delete analysersRef.current[id];
+    }
+    
+    if (peerConnectionsRef.current[id]) {
+      delete peerConnectionsRef.current[id];
     }
   }
 
@@ -761,21 +1021,18 @@ export default function MeetingRoom() {
       return;
     }
 
-    // Validate emoji
     if (!emoji || typeof emoji !== "string" || emoji.length > 10) {
       alert("Invalid emoji selected");
       return;
     }
 
     try {
-      // First ensure profile exists
       const { error: profileError } = await supabase
         .from("profiles")
         .upsert({ id: user.id, email: user.email }, { onConflict: "id" });
 
       if (profileError) throw profileError;
 
-      // Insert reaction
       const { error } = await supabase.from("reactions").insert({
         room_id: roomId,
         user_id: user.id,
@@ -785,7 +1042,6 @@ export default function MeetingRoom() {
 
       if (error) throw error;
 
-      // Also add to messages as a system message
       await supabase.from("messages").insert({
         room_id: roomId,
         sender: "System",
@@ -793,7 +1049,6 @@ export default function MeetingRoom() {
         created_at: new Date().toISOString(),
       });
 
-      // Optimistic update
       setReactions((prev) => [
         ...prev.filter((r) => !(r.user_id === user.id && r.emoji === emoji)),
         {
@@ -814,268 +1069,56 @@ export default function MeetingRoom() {
     }
   }
 
-  async function requestToJoin() {
-    if (!meetingDbId || !user?.id) return;
-
+  async function approveUser(uid) {
     try {
-      console.log("Requesting to join...");
-      const { error } = await supabase.from("participants").upsert(
-        {
-          meeting_id: meetingDbId,
-          user_id: user.id,
-          status: "pending",
-          created_at: new Date().toISOString(),
-        },
-        { onConflict: "meeting_id,user_id" }
-      );
+      console.log("Approving user:", uid);
+      const { error } = await supabase
+        .from("participants")
+        .update({
+          status: "approved",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", uid);
 
       if (error) throw error;
-      console.log("Join request sent successfully");
-      setWaitingForApproval(true);
-      setupParticipantListener(meetingDbId, user.id);
+      console.log("User approved successfully");
+
+      if (permitToJoin && peerRef.current?.id) {
+        const { data: signal } = await supabase
+          .from("signals")
+          .select("peer_id")
+          .eq("room_id", roomId)
+          .eq("user_id", uid)
+          .single();
+
+        if (signal?.peer_id) {
+          connectToPeer(signal.peer_id);
+        }
+      }
     } catch (error) {
-      console.error("Error in requestToJoin:", error);
-      alert("Failed to send request. Please try again.");
+      console.error("Error approving user:", error);
+      alert("Failed to approve user. Please try again.");
     }
   }
 
-  // Room initialization
-  const initRoom = useCallback(async () => {
-    if (isInitialized || !isMountedRef.current) return;
-
+  async function denyUser(uid) {
     try {
-      console.log("Initializing room...");
-      setIsInitialized(true);
+      console.log("Denying user:", uid);
+      const { error } = await supabase
+        .from("participants")
+        .update({
+          status: "denied",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", uid);
 
-      const { data: auth, error: authError } = await supabase.auth.getUser();
-      if (authError || !auth?.user) throw new Error("Not authenticated");
-
-      await ensureProfileExists(auth.user.id);
-      setUser(auth.user);
-
-      const { data: mt, error: mtErr } = await supabase
-        .from("meetings")
-        .select("*")
-        .eq("room_id", roomId)
-        .maybeSingle();
-      if (mtErr || !mt) {
-        console.error("Meeting fetch error:", mtErr);
-        alert("Meeting not found.");
-        return navigate("/");
-      }
-
-      setMeetingDbId(mt.id);
-      const hostStatus = auth.user.id === mt.creator_id;
-      setIsHost(hostStatus);
-      setPasscodeRequired(!!mt.passcode);
-
-      const providedPass =
-        new URLSearchParams(search).get("passcode") || inputPasscode;
-      if (mt.passcode && providedPass !== mt.passcode) {
-        setNeedPasscode(true);
-        return;
-      }
-
-      setNeedPasscode(false);
-
-      if (hostStatus) {
-        console.log("Setting up host...");
-        setPermitToJoin(true);
-
-        try {
-          await requestMediaPermissions();
-          await joinMeeting(mt.id, auth.user.id);
-          setupWaitingListener(mt.id);
-        } catch (err) {
-          console.error("Host setup error:", err);
-          navigate("/");
-        }
-      } else {
-        console.log("Checking participant status...");
-        const { data: existing } = await supabase
-          .from("participants")
-          .select("status")
-          .eq("meeting_id", mt.id)
-          .eq("user_id", auth.user.id)
-          .maybeSingle();
-
-        console.log("Existing participant record:", existing);
-
-        if (!existing || existing.status === "pending") {
-          console.log("Participant needs to request access");
-          setupParticipantListener(mt.id, auth.user.id);
-
-          if (!existing) {
-            await createPendingRequest(mt.id, auth.user.id);
-          } else {
-            setWaitingForApproval(true);
-          }
-        } else if (existing.status === "approved") {
-          console.log(
-            "Already approved, requesting permissions and joining..."
-          );
-          setPermitToJoin(true);
-          try {
-            await requestMediaPermissions();
-            await joinMeeting(mt.id, auth.user.id);
-          } catch (err) {
-            console.error("Approved participant setup error:", err);
-            navigate("/");
-          }
-        } else if (existing.status === "denied") {
-          alert("⛔ Access denied by host.");
-          navigate("/");
-        }
-      }
+      if (error) throw error;
+      console.log("User denied successfully");
     } catch (error) {
-      console.error("Init room error:", error);
-      if (isMountedRef.current) {
-        setIsInitialized(false);
-        alert(error.message || "Failed to initialize room");
-      }
-      navigate("/");
-    }
-  }, [inputPasscode, navigate, roomId, search]);
-
-  async function joinMeeting(meetingId, userId) {
-    if (isJoining) return;
-    setIsJoining(true);
-    setConnectionStatus("Connecting...");
-
-    console.log("Joining meeting...", meetingId, userId);
-
-    try {
-      const stream = await requestMediaPermissions();
-      updateParticipants(meetingId);
-
-      const peer = createPeer();
-      peerRef.current = peer;
-
-      peer.on("open", async (pid) => {
-        console.log("Peer opened with ID:", pid);
-        try {
-          const { error } = await supabase.from("signals").upsert(
-            {
-              room_id: roomId,
-              peer_id: pid,
-              last_active: new Date().toISOString(),
-            },
-            {
-              onConflict: "room_id,peer_id",
-              ignoreDuplicates: false,
-            }
-          );
-
-          if (error) throw error;
-
-          const { data: others, error: fetchError } = await supabase
-            .from("signals")
-            .select("*")
-            .eq("room_id", roomId)
-            .neq("peer_id", pid)
-            .order("last_active", { ascending: false });
-
-          if (fetchError) throw fetchError;
-
-          others?.forEach((o) => connectToPeer(o.peer_id));
-
-          if (!signalsChannel.current) {
-            signalsChannel.current = supabase
-              .channel(`signals:${roomId}`)
-              .on(
-                "postgres_changes",
-                {
-                  event: "*",
-                  schema: "public",
-                  table: "signals",
-                  filter: `room_id=eq.${roomId}`,
-                },
-                (payload) => {
-                  if (payload.new.peer_id !== pid) {
-                    console.log("Peer activity change:", payload);
-                    if (
-                      payload.eventType === "INSERT" ||
-                      payload.eventType === "UPDATE"
-                    ) {
-                      connectToPeer(payload.new.peer_id);
-                    } else if (payload.eventType === "DELETE") {
-                      removeRemote(payload.old.peer_id);
-                    }
-                  }
-                }
-              )
-              .subscribe((status, err) => {
-                if (err) {
-                  console.error("Signals channel error:", err);
-                  setTimeout(() => {
-                    if (signalsChannel.current) {
-                      signalsChannel.current.subscribe();
-                    }
-                  }, 2000);
-                }
-                console.log("Signals channel status:", status);
-              });
-          }
-        } catch (err) {
-          console.error("Error in peer open handler:", err);
-          setTimeout(() => {
-            if (peerRef.current && !peerRef.current.destroyed) {
-              joinMeeting(meetingId, userId);
-            }
-          }, 3000);
-        }
-      });
-
-      peer.on("call", (call) => {
-        console.log("Receiving call from:", call.peer);
-        try {
-          const streamToAnswerWith = isScreenSharing && screenStreamRef.current ? 
-            screenStreamRef.current : 
-            localStreamRef.current;
-            
-          call.answer(streamToAnswerWith);
-          setupCall(call, call.peer);
-        } catch (err) {
-          console.error("Error answering call:", err);
-          setTimeout(() => {
-            if (localStreamRef.current) {
-              call.answer(localStreamRef.current);
-              setupCall(call, call.peer);
-            }
-          }, 1000);
-        }
-      });
-
-      loadMessagesAndReactions();
-      setIsJoining(false);
-    } catch (err) {
-      console.error("Join meeting error:", err);
-      setIsJoining(false);
-      setConnectionStatus("Connection failed");
-      alert(
-        "🛑 Failed to join meeting. Please check your network connection and try again."
-      );
-    }
-  }
-
-  async function cleanupSubscriptions() {
-    try {
-      const channels = [
-        signalsChannel,
-        waitingChannel,
-        participantListener,
-        messagesChannel,
-        reactionsChannel,
-      ];
-
-      for (const channelRef of channels) {
-        if (channelRef.current) {
-          await supabase.removeChannel(channelRef.current);
-          channelRef.current = null;
-        }
-      }
-    } catch (error) {
-      console.warn("Error cleaning up subscriptions:", error);
+      console.error("Error denying user:", error);
+      alert("Failed to deny user. Please try again.");
     }
   }
 
@@ -1134,11 +1177,317 @@ export default function MeetingRoom() {
       setPermitToJoin(false);
       setWaitingForApproval(false);
       
-      // Navigate after cleanup
       navigate("/");
     } catch (err) {
       console.warn("Leave room error:", err);
       navigate("/");
+    }
+  }
+
+  async function cleanupSubscriptions() {
+    try {
+      const channels = [
+        signalsChannel,
+        waitingChannel,
+        participantListener,
+        messagesChannel,
+        reactionsChannel,
+        participantsChannel
+      ];
+
+      for (const channelRef of channels) {
+        if (channelRef.current) {
+          await supabase.removeChannel(channelRef.current);
+          channelRef.current = null;
+        }
+      }
+    } catch (error) {
+      console.warn("Error cleaning up subscriptions:", error);
+    }
+  }
+
+  // Enhanced room initialization with better error recovery
+  const initRoom = useCallback(async () => {
+    if (isInitialized || !isMountedRef.current) return;
+
+    try {
+      console.log("Initializing room...");
+      setIsInitialized(true);
+
+      const { data: auth, error: authError } = await supabase.auth.getUser();
+      if (authError || !auth?.user) throw new Error("Not authenticated");
+
+      await ensureProfileExists(auth.user.id);
+      setUser(auth.user);
+
+      // Retry meeting fetch with exponential backoff
+      let mt;
+      let retries = 0;
+      while (retries < 3) {
+        try {
+          const { data, error } = await supabase
+            .from("meetings")
+            .select("*")
+            .eq("room_id", roomId)
+            .maybeSingle();
+          
+          if (error) throw error;
+          if (!data) throw new Error("Meeting not found");
+          
+          mt = data;
+          break;
+        } catch (err) {
+          retries++;
+          if (retries >= 3) throw err;
+          await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+        }
+      }
+
+      setMeetingDbId(mt.id);
+      const hostStatus = auth.user.id === mt.creator_id;
+      setIsHost(hostStatus);
+      setPasscodeRequired(!!mt.passcode);
+
+      const providedPass =
+        new URLSearchParams(search).get("passcode") || inputPasscode;
+      if (mt.passcode && providedPass !== mt.passcode) {
+        setNeedPasscode(true);
+        return;
+      }
+
+      setNeedPasscode(false);
+
+      if (hostStatus) {
+        console.log("Setting up host...");
+        setPermitToJoin(true);
+
+        try {
+          await requestMediaPermissions();
+          await joinMeeting(mt.id, auth.user.id);
+          setupWaitingListener(mt.id);
+          setupParticipantsListener(mt.id);
+        } catch (err) {
+          console.error("Host setup error:", err);
+          // Attempt recovery
+          setTimeout(() => initRoom(), 3000);
+        }
+      } else {
+        console.log("Checking participant status...");
+        let existing;
+        try {
+          const { data } = await supabase
+            .from("participants")
+            .select("status")
+            .eq("meeting_id", mt.id)
+            .eq("user_id", auth.user.id)
+            .maybeSingle();
+          existing = data;
+        } catch (err) {
+          console.error("Error checking participant status:", err);
+          // Retry after delay
+          setTimeout(() => initRoom(), 2000);
+          return;
+        }
+
+        console.log("Existing participant record:", existing);
+
+        if (!existing || existing.status === "pending") {
+          console.log("Participant needs to request access");
+          setupParticipantListener(mt.id, auth.user.id);
+
+          if (!existing) {
+            await createPendingRequest(mt.id, auth.user.id);
+          } else {
+            setWaitingForApproval(true);
+          }
+        } else if (existing.status === "approved") {
+          console.log("Already approved, requesting permissions and joining...");
+          setPermitToJoin(true);
+          try {
+            await requestMediaPermissions();
+            await joinMeeting(mt.id, auth.user.id);
+            setupParticipantsListener(mt.id);
+          } catch (err) {
+            console.error("Approved participant setup error:", err);
+            // Attempt recovery
+            setTimeout(() => initRoom(), 3000);
+          }
+        } else if (existing.status === "denied") {
+          alert("⛔ Access denied by host.");
+          navigate("/");
+        }
+      }
+    } catch (error) {
+      console.error("Init room error:", error);
+      if (isMountedRef.current) {
+        setIsInitialized(false);
+        alert(error.message || "Failed to initialize room");
+        // Retry initialization after delay
+        setTimeout(() => initRoom(), 5000);
+      }
+    }
+  }, [inputPasscode, navigate, roomId, search]);
+
+  // Enhanced joinMeeting function with better connection handling
+  async function joinMeeting(meetingId, userId) {
+    if (isJoining) return;
+    setIsJoining(true);
+    setConnectionStatus("Connecting...");
+
+    console.log("Joining meeting...", meetingId, userId);
+
+    try {
+      const stream = await requestMediaPermissions();
+      updateParticipants(meetingId);
+
+      const peer = createPeer();
+      peerRef.current = peer;
+
+      peer.on("open", async (pid) => {
+        console.log("Peer opened with ID:", pid);
+        try {
+          // Update participant names with our own info
+          setParticipantNames(prev => ({
+            ...prev,
+            [pid]: user?.email || pid.substring(0, 8)
+          }));
+
+          // Upsert our signal with retry logic
+          let attempts = 0;
+          const maxAttempts = 3;
+          
+          while (attempts < maxAttempts) {
+            try {
+              const { error } = await supabase.from("signals").upsert(
+                {
+                  room_id: roomId,
+                  peer_id: pid,
+                  user_id: userId,
+                  last_active: new Date().toISOString(),
+                },
+                {
+                  onConflict: "room_id,peer_id",
+                  ignoreDuplicates: false,
+                }
+              );
+
+              if (error) throw error;
+              break; // Success, exit retry loop
+            } catch (err) {
+              attempts++;
+              if (attempts >= maxAttempts) throw err;
+              await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+            }
+          }
+
+          // Connect to all existing participants with parallel connections
+          const { data: others, error: fetchError } = await supabase
+            .from("signals")
+            .select("*")
+            .eq("room_id", roomId)
+            .neq("peer_id", pid)
+            .order("last_active", { ascending: false });
+
+          if (fetchError) throw fetchError;
+
+          if (others && others.length > 0) {
+            console.log(`Connecting to ${others.length} existing participants`);
+            // Use Promise.all to connect in parallel but limit concurrency
+            const MAX_CONCURRENT_CONNECTIONS = 3;
+            const connectionGroups = [];
+            
+            for (let i = 0; i < others.length; i += MAX_CONCURRENT_CONNECTIONS) {
+              connectionGroups.push(others.slice(i, i + MAX_CONCURRENT_CONNECTIONS));
+            }
+            
+            for (const group of connectionGroups) {
+              await Promise.all(group.map(o => connectToPeer(o.peer_id)));
+            }
+          }
+
+          if (!signalsChannel.current) {
+            signalsChannel.current = supabase
+              .channel(`signals:${roomId}`)
+              .on(
+                "postgres_changes",
+                {
+                  event: "*",
+                  schema: "public",
+                  table: "signals",
+                  filter: `room_id=eq.${roomId}`,
+                },
+                (payload) => {
+                  if (payload.new.peer_id !== pid) {
+                    console.log("Peer activity change:", payload);
+                    if (
+                      payload.eventType === "INSERT" ||
+                      payload.eventType === "UPDATE"
+                    ) {
+                      // Only connect if we don't already have a connection
+                      if (!peerConnectionsRef.current[payload.new.peer_id]) {
+                        connectToPeer(payload.new.peer_id);
+                      }
+                    } else if (payload.eventType === "DELETE") {
+                      removeRemote(payload.old.peer_id);
+                    }
+                  }
+                }
+              )
+              .subscribe((status, err) => {
+                if (err) {
+                  console.error("Signals channel error:", err);
+                  setTimeout(() => {
+                    if (signalsChannel.current) {
+                      signalsChannel.current.subscribe();
+                    }
+                  }, 2000);
+                }
+                console.log("Signals channel status:", status);
+              });
+          }
+        } catch (err) {
+          console.error("Error in peer open handler:", err);
+          setTimeout(() => {
+            if (peerRef.current && !peerRef.current.destroyed) {
+              joinMeeting(meetingId, userId);
+            }
+          }, 3000);
+        }
+      });
+
+      peer.on("call", (call) => {
+        console.log("Receiving call from:", call.peer);
+        try {
+          const streamToAnswerWith = isScreenSharing && screenStreamRef.current ? 
+            new MediaStream([
+              ...screenStreamRef.current.getVideoTracks(),
+              ...localStreamRef.current.getAudioTracks()
+            ]) : 
+            localStreamRef.current;
+            
+          call.answer(streamToAnswerWith);
+          peerConnectionsRef.current[call.peer] = call;
+          setupCall(call, call.peer);
+        } catch (err) {
+          console.error("Error answering call:", err);
+          setTimeout(() => {
+            if (localStreamRef.current) {
+              call.answer(localStreamRef.current);
+              peerConnectionsRef.current[call.peer] = call;
+              setupCall(call, call.peer);
+            }
+          }, 1000);
+        }
+      });
+
+      loadMessagesAndReactions();
+      setIsJoining(false);
+    } catch (err) {
+      console.error("Join meeting error:", err);
+      setIsJoining(false);
+      setConnectionStatus("Connection failed");
+      // Attempt recovery
+      setTimeout(() => joinMeeting(meetingId, userId), 5000);
     }
   }
 
@@ -1158,6 +1507,12 @@ export default function MeetingRoom() {
     return () => {
       isMountedRef.current = false;
       leaveRoom();
+      
+      // Clean up audio context
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
     };
   }, [needPasscode, initRoom]);
 
@@ -1219,14 +1574,18 @@ export default function MeetingRoom() {
               autoPlay
               playsInline
               muted
-              className="w-full h-64 object-contain"
+              className="w-full h-64 object-cover"
             />
             <div className="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm">
               {user?.email || "You"}
               {isMuted ? " 🔇" : " 🔊"}
               {!cameraOn ? " 📷❌" : " 📷"}
               {isScreenSharing && " 🖥️"}
+              {activeSpeakers['local'] && " 🗣️"}
             </div>
+            <div className={`absolute top-2 right-2 w-3 h-3 rounded-full ${
+              activeSpeakers['local'] ? 'bg-green-500' : 'bg-transparent'
+            }`}></div>
           </div>
 
           {/* Remote videos */}
@@ -1285,20 +1644,46 @@ export default function MeetingRoom() {
           </div>
 
           {/* Status */}
-          <div className="text-center text-sm text-gray-600">
-            {connectionStatus}
+          <div className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${
+              connectionStatus === 'Connected' ? 'bg-green-500' : 
+              connectionStatus.includes('Error') ? 'bg-red-500' : 'bg-yellow-500'
+            }`}></div>
+            <span className="text-sm">{connectionStatus}</span>
           </div>
         </div>
 
         {/* Sidebar */}
         <div className="space-y-4">
+          {/* Participants list */}
+          {permitToJoin && (
+            <div className="bg-white border rounded-lg p-3">
+              <h3 className="font-bold mb-2">👥 Participants ({participants.length})</h3>
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {participants.map((participantId) => (
+                  <div key={participantId} className="flex items-center p-2 bg-gray-50 rounded">
+                    <span className="text-sm truncate">
+                      {participantNames[participantId] || participantId.substring(0, 8)}
+                    </span>
+                    {participantId === user?.id && (
+                      <span className="ml-2 text-xs text-gray-500">(You)</span>
+                    )}
+                    {activeSpeakers[participantId] && (
+                      <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Waiting list (host only) */}
           {isHost && waitingList.length > 0 && (
             <div className="bg-white border rounded-lg p-3">
               <h3 className="font-bold mb-2">👥 Waiting Room ({waitingList.length})</h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
                 {waitingList.map((req) => (
-                  <div key={req.id} className="flex items-center justify-between p-2 bg-gray-50 rounded">+
+                  <div key={req.id} className="flex items-center justify-between p-2 bg-gray-50 rounded">
                     <span className="text-sm truncate">{req.profiles?.email || req.user_id}</span>
                     <div className="flex gap-1">
                       <button
@@ -1306,14 +1691,14 @@ export default function MeetingRoom() {
                         className="p-1 bg-green-500 text-white rounded hover:bg-green-600"
                         title="Approve"
                       >
-                        ✓Admit
+                        ✓ Admit
                       </button>
                       <button
                         onClick={() => denyUser(req.user_id)}
                         className="p-1 bg-red-500 text-white rounded hover:bg-red-600"
                         title="Deny"
                       >
-                        ✗Deny
+                        ✗ Deny
                       </button>
                     </div>
                   </div>
