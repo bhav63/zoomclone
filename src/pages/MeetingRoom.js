@@ -35,6 +35,9 @@ export default function MeetingRoom() {
   const [participantNames, setParticipantNames] = useState({});
   const [activeSpeakers, setActiveSpeakers] = useState({});
   const [connectionStats, setConnectionStats] = useState({});
+  const [showRecordingAlert, setShowRecordingAlert] = useState(false);
+  const [recordingAlertMessage, setRecordingAlertMessage] = useState("");
+  const [autoReconnectAttempts, setAutoReconnectAttempts] = useState(0);
 
   // Refs
   const peerRef = useRef();
@@ -50,6 +53,9 @@ export default function MeetingRoom() {
   const analysersRef = useRef({});
   const peerConnectionsRef = useRef({});
   const statsIntervalRef = useRef();
+  const recordingTimerRef = useRef();
+  const reconnectTimerRef = useRef();
+  const participantUpdateTimeoutRef = useRef();
 
   // Supabase channels
   const waitingChannel = useRef();
@@ -81,7 +87,6 @@ export default function MeetingRoom() {
 
   async function createPendingRequest(meetingId, userId) {
     try {
-      console.log("Creating pending request...");
       await ensureProfileExists(userId);
 
       const { error } = await supabase.from("participants").upsert(
@@ -95,7 +100,6 @@ export default function MeetingRoom() {
       );
 
       if (error) throw error;
-      console.log("Pending request created successfully");
       setWaitingForApproval(true);
     } catch (error) {
       console.error("Error in createPendingRequest:", error);
@@ -104,8 +108,6 @@ export default function MeetingRoom() {
   }
 
   function setupWaitingListener(mtId) {
-    console.log("Setting up waiting listener for meeting:", mtId);
-
     updateWaitingList(mtId);
 
     if (!waitingChannel.current) {
@@ -120,19 +122,14 @@ export default function MeetingRoom() {
             filter: `meeting_id=eq.${mtId}`,
           },
           (payload) => {
-            console.log("Participant change detected:", payload);
             updateWaitingList(mtId);
           }
         )
-        .subscribe((status) => {
-          console.log("Waiting channel subscription status:", status);
-        });
+        .subscribe();
     }
   }
 
   function setupParticipantListener(mtId, uid) {
-    console.log("Setting up participant listener for:", mtId, uid);
-
     if (!participantListener.current) {
       participantListener.current = supabase
         .channel(`participant:${mtId}:${uid}`)
@@ -145,11 +142,9 @@ export default function MeetingRoom() {
             filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
           },
           async (payload) => {
-            console.log("Participant status update:", payload.new);
             if (payload.new.status === "approved") {
               setWaitingForApproval(false);
               setPermitToJoin(true);
-              alert("✅ Approved! Joining meeting...");
               try {
                 await requestMediaPermissions();
                 await joinMeeting(mtId, uid);
@@ -157,53 +152,31 @@ export default function MeetingRoom() {
                 if (peerRef.current?.id) {
                   const { data: others } = await supabase
                     .from("signals")
-                    .select("peer_id")
+                    .select("peer_id, user_id")
                     .eq("room_id", roomId)
                     .neq("peer_id", peerRef.current.id);
 
-                  if (others && others.length > 0) {
-                    others.forEach(({ peer_id }) => {
-                      connectToPeer(peer_id);
-                    });
+                  if (others?.length > 0) {
+                    await Promise.all(others.map(({ peer_id }) => connectToPeer(peer_id)));
+                    
+                    // Update last_active to trigger connection from others
+                    await supabase
+                      .from("signals")
+                      .update({ last_active: new Date().toISOString() })
+                      .eq("room_id", roomId)
+                      .eq("peer_id", peerRef.current.id);
                   }
                 }
               } catch (err) {
                 console.error("Error joining after approval:", err);
-                alert("Failed to join meeting. Please refresh and try again.");
               }
             } else if (payload.new.status === "denied") {
               setWaitingForApproval(false);
-              alert("⛔ Access denied by host.");
               navigate("/");
             }
           }
         )
-        .subscribe((status) => {
-          console.log("Participant listener subscription status:", status);
-        });
-    }
-  }
-
-  function setupParticipantsListener(mtId) {
-    if (!participantsChannel.current) {
-      participantsChannel.current = supabase
-        .channel(`participants:${mtId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId}`,
-          },
-          (payload) => {
-            console.log("Participants change detected:", payload);
-            updateParticipants(mtId);
-          }
-        )
-        .subscribe((status) => {
-          console.log("Participants channel subscription status:", status);
-        });
+        .subscribe();
     }
   }
 
@@ -220,14 +193,14 @@ export default function MeetingRoom() {
         
         const names = {};
         data.forEach(p => {
-          names[p.user_id] = p.profiles?.email || p.user_id.substring(0, 8);
+          names[p.user_id] = p.profiles?.email || p.user_id;
         });
         setParticipantNames(names);
         
         Object.keys(remoteVideosRef.current).forEach(peerId => {
-          const label = remoteVideosRef.current[peerId].querySelector('div');
+          const label = remoteVideosRef.current[peerId]?.querySelector('.participant-label');
           if (label) {
-            label.textContent = names[peerId] || peerId.substring(0, 8);
+            label.textContent = names[peerId] || peerId;
           }
         });
       }
@@ -238,41 +211,23 @@ export default function MeetingRoom() {
 
   async function updateWaitingList(mtId) {
     try {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from("participants")
-        .select(
-          `
-          id,
-          user_id,
-          status,
-          profiles:user_id(email),
-          created_at
-        `
-        )
+        .select("id, user_id, status, profiles:user_id(email), created_at")
         .eq("meeting_id", mtId)
         .eq("status", "pending")
         .order("created_at", { ascending: true });
 
-      if (error) {
-        console.error("Error fetching waiting list:", error);
-        return;
-      }
-
-      console.log("Updated waiting list:", data);
       setWaitingList(data || []);
     } catch (error) {
       console.error("Error in updateWaitingList:", error);
     }
   }
 
-  // Enhanced media functions with error handling
   async function requestMediaPermissions() {
-    if (localStreamRef.current) {
-      return localStreamRef.current;
-    }
+    if (localStreamRef.current) return localStreamRef.current;
 
     try {
-      console.log("Requesting media permissions...");
       const constraints = {
         audio: {
           echoCancellation: true,
@@ -287,12 +242,6 @@ export default function MeetingRoom() {
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-
-      // Handle cases where browser might return stream without tracks
-      if (!stream.getAudioTracks().length && !stream.getVideoTracks().length) {
-        throw new Error("No media tracks received");
-      }
-
       localStreamRef.current = stream;
 
       if (localVideoRef.current) {
@@ -303,38 +252,28 @@ export default function MeetingRoom() {
       stream.getVideoTracks().forEach((track) => (track.enabled = cameraOn));
 
       setMediaPermissionGranted(true);
-      console.log("Media permissions granted");
-      
       setupAudioContext(stream);
       
       return stream;
     } catch (err) {
       console.error("Media permission error:", err);
-      
-      // Try fallback constraints if the ideal ones fail
-      if (err.name === 'OverconstrainedError' || err.name === 'ConstraintNotSatisfiedError') {
-        try {
-          console.log("Trying fallback media constraints...");
-          const fallbackStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: true
-          });
-          
-          localStreamRef.current = fallbackStream;
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = fallbackStream;
-          }
-          
-          setMediaPermissionGranted(true);
-          return fallbackStream;
-        } catch (fallbackError) {
-          console.error("Fallback media error:", fallbackError);
-          throw fallbackError;
+      try {
+        const fallbackStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: true
+        });
+        
+        localStreamRef.current = fallbackStream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = fallbackStream;
         }
+        
+        setMediaPermissionGranted(true);
+        return fallbackStream;
+      } catch (fallbackError) {
+        console.error("Fallback media error:", fallbackError);
+        throw fallbackError;
       }
-      
-      alert("🛑 Please allow camera & mic access to join the meeting.");
-      throw err;
     }
   }
 
@@ -352,7 +291,6 @@ export default function MeetingRoom() {
       source.connect(analyser);
       
       analysersRef.current['local'] = analyser;
-      
       analyzeAudio();
     } catch (err) {
       console.error("Audio context setup error:", err);
@@ -366,14 +304,12 @@ export default function MeetingRoom() {
     const dataArray = new Uint8Array(bufferLength);
     const newActiveSpeakers = {...activeSpeakers};
     
-    // Analyze local audio
     if (analysersRef.current['local']) {
       analysersRef.current['local'].getByteFrequencyData(dataArray);
       const volume = Math.max(...dataArray);
       newActiveSpeakers['local'] = volume > 30;
     }
     
-    // Analyze remote audio
     Object.keys(analysersRef.current).forEach(peerId => {
       if (peerId !== 'local') {
         analysersRef.current[peerId].getByteFrequencyData(dataArray);
@@ -386,86 +322,54 @@ export default function MeetingRoom() {
     requestAnimationFrame(analyzeAudio);
   }
 
-  // Enhanced screen sharing with aspect ratio preservation
-  async function toggleScreenShare() {
-    try {
-      if (isScreenSharing) {
-        // Stop screen sharing
-        if (screenStreamRef.current) {
-          screenStreamRef.current.getTracks().forEach(track => track.stop());
-          screenStreamRef.current = null;
-        }
-        
-        // Switch back to camera
-        if (localStreamRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current;
-          
-          // Update all peer connections with the camera stream
-          updateAllPeerConnections(localStreamRef.current);
-        }
-        
-        setIsScreenSharing(false);
-      } else {
-        // Start screen sharing with better constraints
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            cursor: "always",
-            width: { ideal: 1920, max: 1920 },
-            height: { ideal: 1080, max: 1080 },
-            frameRate: { ideal: 30, max: 30 },
-            resizeMode: "crop-and-scale" // Preserve aspect ratio
-          },
-          audio: false
+  const toggleScreenShare = async () => {
+  try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+      });
+      const screenTrack = screenStream.getVideoTracks()[0];
+
+      for (const connArray of Object.values(peerRef.current.connections)) {
+        connArray.forEach((conn) => {
+          const sender = conn.peerConnection
+            .getSenders()
+            .find((s) => s.track.kind === "video");
+          sender?.replaceTrack(screenTrack);
         });
-
-        screenStreamRef.current = screenStream;
-        
-        // Combine with audio from local stream
-        const combinedStream = new MediaStream([
-          ...screenStream.getVideoTracks(),
-          ...(localStreamRef.current?.getAudioTracks() || [])
-        ]);
-        
-        localVideoRef.current.srcObject = combinedStream;
-        setIsScreenSharing(true);
-
-        // Handle when user stops sharing via browser UI
-        screenStream.getVideoTracks()[0].onended = () => {
-          if (localStreamRef.current) {
-            localVideoRef.current.srcObject = localStreamRef.current;
-          }
-          setIsScreenSharing(false);
-        };
-
-        // Update all peer connections with the screen share stream
-        updateAllPeerConnections(combinedStream);
       }
-    } catch (err) {
-      console.error("Screen share error:", err);
-      if (localStreamRef.current) {
+
+      screenTrack.onended = () => {
+        const camTrack = localStreamRef.current.getVideoTracks()[0];
+        for (const connArray of Object.values(peerRef.current.connections)) {
+          connArray.forEach((conn) => {
+            const sender = conn.peerConnection
+              .getSenders()
+              .find((s) => s.track.kind === "video");
+            sender?.replaceTrack(camTrack);
+          });
+        }
         localVideoRef.current.srcObject = localStreamRef.current;
-      }
-      setIsScreenSharing(false);
+      };
+    } catch {
+      alert("Screen share failed.");
     }
-  }
+};
 
   function updateAllPeerConnections(stream) {
     if (!peerRef.current) return;
 
     Object.keys(peerRef.current.connections).forEach(peerId => {
       peerRef.current.connections[peerId].forEach(connection => {
-        if (connection.peerConnection && connection.peerConnection.getSenders) {
+        if (connection.peerConnection?.getSenders) {
           const senders = connection.peerConnection.getSenders();
           const videoTrack = stream.getVideoTracks()[0];
           const audioTrack = stream.getAudioTracks()[0];
           
           senders.forEach(sender => {
             if (sender.track.kind === 'video' && videoTrack) {
-              sender.replaceTrack(videoTrack)
-                .catch(err => console.error("Error replacing video track:", err));
+              sender.replaceTrack(videoTrack).catch(console.error);
             } else if (sender.track.kind === 'audio' && audioTrack) {
-              sender.replaceTrack(audioTrack)
-                .catch(err => console.error("Error replacing audio track:", err));
+              sender.replaceTrack(audioTrack).catch(console.error);
             }
           });
         }
@@ -523,22 +427,38 @@ export default function MeetingRoom() {
       recorder.startRecording();
       recorderRef.current = recorder;
       setIsRecording(true);
-      alert("🔴 Recording started!");
+      
+      setRecordingAlertMessage("Recording started");
+      setShowRecordingAlert(true);
+      setTimeout(() => setShowRecordingAlert(false), 3000);
+      
+      let seconds = 0;
+      recordingTimerRef.current = setInterval(() => {
+        seconds++;
+        setRecordingAlertMessage(`Recording (${formatTime(seconds)})`);
+      }, 1000);
     } catch (err) {
       console.error("Recording start error:", err);
       alert("Failed to start recording.");
     }
   }
 
+  function formatTime(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+
   async function stopRecording() {
     if (!recorderRef.current) return;
     try {
+      clearInterval(recordingTimerRef.current);
+      
       await new Promise((resolve) => {
         recorderRef.current.stopRecording(resolve);
       });
       
       const blob = recorderRef.current.getBlob();
-      
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const filename = `recording-${roomId}-${timestamp}.webm`;
       
@@ -549,11 +469,7 @@ export default function MeetingRoom() {
           upsert: false
         });
       
-      if (error) {
-        console.error("Upload error:", error);
-        alert("Failed to upload recording.");
-        return;
-      }
+      if (error) throw error;
       
       const { data: { publicUrl } } = supabase.storage
         .from("recordings")
@@ -570,21 +486,25 @@ export default function MeetingRoom() {
         created_at: new Date().toISOString()
       });
       
-      alert("✅ Recording saved and uploaded successfully!");
       setIsRecording(false);
       recorderRef.current = null;
+      
+      setRecordingAlertMessage("Recording saved successfully");
+      setShowRecordingAlert(true);
+      setTimeout(() => setShowRecordingAlert(false), 3000);
     } catch (err) {
       console.error("Recording stop error:", err);
       setIsRecording(false);
       recorderRef.current = null;
-      alert("Failed to save recording. Please try again.");
+      setRecordingAlertMessage("Failed to save recording");
+      setShowRecordingAlert(true);
+      setTimeout(() => setShowRecordingAlert(false), 3000);
     }
   }
 
-  // Enhanced PeerJS functions with better connection handling
   const createPeer = () => {
     const peer = new Peer({
-      debug: 3, // More verbose logging
+      debug: 3,
       config: {
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
@@ -597,12 +517,12 @@ export default function MeetingRoom() {
           }
         ],
         iceTransportPolicy: "all",
-        iceCandidatePoolSize: 5, // Increased pool size
-        rtcpMuxPolicy: "require", // Better for mobile
-        bundlePolicy: "max-bundle", // More efficient
-        sdpSemantics: "unified-plan" // Modern SDP
+        iceCandidatePoolSize: 5,
+        rtcpMuxPolicy: "require",
+        bundlePolicy: "max-bundle",
+        sdpSemantics: "unified-plan"
       },
-      reconnectTimer: 5000, // Faster reconnection
+      reconnectTimer: 5000,
     });
 
     peer.on("error", (err) => {
@@ -610,21 +530,18 @@ export default function MeetingRoom() {
       setConnectionStatus(`Error: ${err.type}`);
 
       if (err.type === "peer-unavailable") {
-        console.warn("Peer unavailable, will retry...");
         setTimeout(() => {
           if (isMountedRef.current && peerRef.current?.disconnected) {
             peerRef.current.reconnect();
           }
         }, 2000);
       } else if (err.type === "socket-error") {
-        console.error("Socket error, attempting to reconnect...");
         setTimeout(() => {
           if (isMountedRef.current && peerRef.current?.disconnected) {
             peerRef.current.reconnect();
           }
         }, 2000);
       } else if (err.type === "network") {
-        console.error("Network error, will retry...");
         setTimeout(() => {
           if (isMountedRef.current && peerRef.current?.disconnected) {
             peerRef.current.reconnect();
@@ -634,28 +551,18 @@ export default function MeetingRoom() {
     });
 
     peer.on("iceConnectionStateChange", (state) => {
-      console.log("ICE connection state:", state);
       setConnectionStatus(state.charAt(0).toUpperCase() + state.slice(1));
 
-      if (state === "failed") {
-        console.warn("ICE connection failed, attempting recovery...");
+      if (state === "failed" || state === "disconnected") {
         setTimeout(() => {
           if (isMountedRef.current) {
             reconnectPeers();
           }
         }, 2000);
-      } else if (state === "disconnected") {
-        console.warn("ICE connection disconnected, attempting recovery...");
-        setTimeout(() => {
-          if (isMountedRef.current) {
-            reconnectPeers();
-          }
-        }, 1000);
       }
     });
 
     peer.on("connectionStateChange", (state) => {
-      console.log("Peer connection state:", state);
       if (state === "disconnected") {
         setTimeout(() => {
           if (isMountedRef.current && peerRef.current?.disconnected) {
@@ -669,7 +576,7 @@ export default function MeetingRoom() {
   };
 
   const reconnectPeers = async () => {
-    if (!peerRef.current || !peerRef.current.id) return;
+    if (!peerRef.current?.id) return;
 
     try {
       const { data: others } = await supabase
@@ -678,14 +585,17 @@ export default function MeetingRoom() {
         .eq("room_id", roomId)
         .neq("peer_id", peerRef.current.id);
 
-      if (others && others.length > 0) {
-        console.log("Reconnecting to peers:", others);
-        others.forEach(({ peer_id, user_id }) => {
-          // Only reconnect if we don't already have an active connection
-          if (!peerConnectionsRef.current[peer_id]) {
-            connectToPeer(peer_id);
-          }
-        });
+      if (others?.length > 0) {
+        const MAX_CONCURRENT_CONNECTIONS = 3;
+        const connectionGroups = [];
+        
+        for (let i = 0; i < others.length; i += MAX_CONCURRENT_CONNECTIONS) {
+          connectionGroups.push(others.slice(i, i + MAX_CONCURRENT_CONNECTIONS));
+        }
+        
+        for (const group of connectionGroups) {
+          await Promise.all(group.map(o => connectToPeer(o.peer_id)));
+        }
       }
     } catch (error) {
       console.error("Reconnection error:", error);
@@ -695,28 +605,15 @@ export default function MeetingRoom() {
   const connectToPeer = async (peerId) => {
     if (!peerRef.current || !localStreamRef.current) return;
 
-    // Skip if already connected
-    if (peerConnectionsRef.current[peerId]) {
-      console.log(`Already connected to ${peerId}, skipping`);
-      return;
-    }
+    if (peerConnectionsRef.current[peerId]) return;
 
     if (!retryCountsRef.current[peerId]) {
       retryCountsRef.current[peerId] = 0;
     }
 
-    if (retryCountsRef.current[peerId] >= 5) {
-      console.warn(`Max retries reached for peer ${peerId}`);
-      return;
-    }
+    if (retryCountsRef.current[peerId] >= 5) return;
 
     try {
-      console.log(
-        `Connecting to peer: ${peerId}, attempt: ${
-          retryCountsRef.current[peerId] + 1
-        }`
-      );
-
       const streamToSend = isScreenSharing && screenStreamRef.current ? 
         new MediaStream([
           ...screenStreamRef.current.getVideoTracks(),
@@ -734,19 +631,13 @@ export default function MeetingRoom() {
       retryCountsRef.current[peerId] += 1;
       delete peerConnectionsRef.current[peerId];
 
-      const delay = Math.min(
-        1000 * Math.pow(2, retryCountsRef.current[peerId]),
-        8000
-      );
+      const delay = Math.min(1000 * Math.pow(2, retryCountsRef.current[peerId]), 8000);
       setTimeout(() => connectToPeer(peerId), delay);
     }
   };
 
   const setupCall = (call, peerId) => {
     call.on("stream", (remoteStream) => {
-      console.log("Received stream from:", peerId);
-      
-      // Setup audio analysis for remote stream
       if (!audioContextRef.current) {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         audioContextRef.current = new AudioContext();
@@ -760,22 +651,18 @@ export default function MeetingRoom() {
       
       addRemote(peerId, remoteStream);
       setConnectionStatus("Connected");
+      setAutoReconnectAttempts(0);
       
-      // Start connection stats monitoring
       if (!statsIntervalRef.current) {
         startConnectionStats();
       }
     });
 
     call.on("close", () => {
-      console.log("Call closed with:", peerId);
       removeRemote(peerId);
       delete peerConnectionsRef.current[peerId];
       setConnectionStatus("Disconnected");
-      
-      if (analysersRef.current[peerId]) {
-        delete analysersRef.current[peerId];
-      }
+      delete analysersRef.current[peerId];
     });
 
     call.on("error", (err) => {
@@ -783,16 +670,11 @@ export default function MeetingRoom() {
       removeRemote(peerId);
       delete peerConnectionsRef.current[peerId];
       setConnectionStatus("Error: " + err.message);
-      
-      if (analysersRef.current[peerId]) {
-        delete analysersRef.current[peerId];
-      }
+      delete analysersRef.current[peerId];
     });
 
     call.on("iceStateChanged", (state) => {
-      console.log(`ICE state with ${peerId}:`, state);
       if (state === "disconnected" || state === "failed") {
-        console.warn(`Connection to ${peerId} is ${state}, attempting recovery`);
         setTimeout(() => connectToPeer(peerId), 2000);
       }
     });
@@ -808,26 +690,22 @@ export default function MeetingRoom() {
       
       Object.entries(peerConnectionsRef.current).forEach(([peerId, call]) => {
         if (call.peerConnection) {
-          try {
-            call.peerConnection.getStats().then(results => {
-              results.forEach(report => {
-                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                  stats[peerId] = {
-                    rtt: report.currentRoundTripTime,
-                    packetsLost: report.packetsLost,
-                    bytesSent: report.bytesSent,
-                    bytesReceived: report.bytesReceived
-                  };
-                }
-              });
-              setConnectionStats(stats);
+          call.peerConnection.getStats().then(results => {
+            results.forEach(report => {
+              if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                stats[peerId] = {
+                  rtt: report.currentRoundTripTime,
+                  packetsLost: report.packetsLost,
+                  bytesSent: report.bytesSent,
+                  bytesReceived: report.bytesReceived
+                };
+              }
             });
-          } catch (err) {
-            console.error("Error getting stats for peer", peerId, err);
-          }
+            setConnectionStats(stats);
+          }).catch(console.error);
         }
       });
-    }, 5000); // Update stats every 5 seconds
+    }, 5000);
   }
 
   function addRemote(id, stream) {
@@ -843,7 +721,6 @@ export default function MeetingRoom() {
     vid.playsInline = true;
     vid.className = "w-full h-full object-cover";
     
-    // Add audio context for this remote stream
     if (!audioContextRef.current) {
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       audioContextRef.current = new AudioContext();
@@ -856,16 +733,13 @@ export default function MeetingRoom() {
     analysersRef.current[id] = analyser;
 
     const label = document.createElement("div");
-    label.className =
-      "absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
-    label.textContent = participantNames[id] || id.substring(0, 8);
+    label.className = "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+    label.textContent = participantNames[id] || id;
     
-    // Add speaking indicator
     const speakingIndicator = document.createElement("div");
     speakingIndicator.className = "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
     speakingIndicator.id = `speaking-${id}`;
 
-    // Add connection stats
     const statsElement = document.createElement("div");
     statsElement.className = "absolute top-2 left-2 bg-black bg-opacity-50 text-white text-xs px-1 rounded";
     statsElement.id = `stats-${id}`;
@@ -879,11 +753,9 @@ export default function MeetingRoom() {
     const container = document.getElementById("remote-videos");
     if (container) container.appendChild(div);
     
-    // Update UI elements periodically
     const updateUIElements = () => {
       if (!isMountedRef.current) return;
       
-      // Update speaking indicator
       const indicator = document.getElementById(`speaking-${id}`);
       if (indicator) {
         indicator.className = `absolute top-2 right-2 w-3 h-3 rounded-full ${
@@ -891,7 +763,6 @@ export default function MeetingRoom() {
         }`;
       }
       
-      // Update stats
       const statsDisplay = document.getElementById(`stats-${id}`);
       if (statsDisplay && connectionStats[id]) {
         const { rtt, packetsLost } = connectionStats[id];
@@ -947,13 +818,12 @@ export default function MeetingRoom() {
           .subscribe();
       }
 
-      const { data: oldReacts, error: reactsError } = await supabase
+      const { data: oldReacts } = await supabase
         .from("reactions")
         .select("*")
         .eq("room_id", roomId)
         .order("created_at", { ascending: true });
 
-      if (reactsError) throw reactsError;
       setReactions(oldReacts || []);
 
       if (!reactionsChannel.current) {
@@ -972,9 +842,7 @@ export default function MeetingRoom() {
                 if (payload.eventType === "INSERT") {
                   setReactions((prev) => [...prev, payload.new]);
                 } else if (payload.eventType === "DELETE") {
-                  setReactions((prev) =>
-                    prev.filter((r) => r.id !== payload.old.id)
-                  );
+                  setReactions((prev) => prev.filter((r) => r.id !== payload.old.id));
                 }
               } catch (e) {
                 console.error("Error processing reaction update:", e);
@@ -983,7 +851,6 @@ export default function MeetingRoom() {
           )
           .subscribe((status, err) => {
             if (err) {
-              console.error("Reactions channel error:", err);
               setTimeout(() => {
                 if (reactionsChannel.current) {
                   reactionsChannel.current.subscribe();
@@ -999,6 +866,19 @@ export default function MeetingRoom() {
 
   async function sendMessage() {
     if (!chatInput.trim() || !user?.email) return;
+    
+    const tempId = Date.now().toString();
+    const newMessage = {
+      id: tempId,
+      room_id: roomId,
+      sender: user.email,
+      text: chatInput,
+      created_at: new Date().toISOString()
+    };
+    
+    setMessages(prev => [...prev, newMessage]);
+    setChatInput("");
+    
     try {
       const { error } = await supabase.from("messages").insert({
         room_id: roomId,
@@ -1007,8 +887,10 @@ export default function MeetingRoom() {
         created_at: new Date().toISOString(),
       });
 
-      if (error) throw error;
-      setChatInput("");
+      if (error) {
+        setMessages(prev => prev.filter(msg => msg.id !== tempId));
+        throw error;
+      }
     } catch (error) {
       console.error("Error sending message:", error);
       alert("Failed to send message. Please try again.");
@@ -1016,15 +898,19 @@ export default function MeetingRoom() {
   }
 
   async function sendReaction(emoji) {
-    if (!user?.id || !roomId) {
-      console.error("User or room information missing");
-      return;
-    }
+    if (!user?.id || !roomId) return;
+    if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
 
-    if (!emoji || typeof emoji !== "string" || emoji.length > 10) {
-      alert("Invalid emoji selected");
-      return;
-    }
+    const tempId = Date.now().toString();
+    const newReaction = {
+      id: tempId,
+      room_id: roomId,
+      user_id: user.id,
+      emoji,
+      created_at: new Date().toISOString()
+    };
+    
+    setReactions(prev => [...prev, newReaction]);
 
     try {
       const { error: profileError } = await supabase
@@ -1040,25 +926,31 @@ export default function MeetingRoom() {
         created_at: new Date().toISOString(),
       });
 
-      if (error) throw error;
+      if (error) {
+        setReactions(prev => prev.filter(r => r.id !== tempId));
+        throw error;
+      }
 
-      await supabase.from("messages").insert({
+      // Add system message for reaction
+      const { error: messageError } = await supabase.from("messages").insert({
         room_id: roomId,
         sender: "System",
         text: `${user.email} reacted with ${emoji}`,
         created_at: new Date().toISOString(),
       });
 
-      setReactions((prev) => [
-        ...prev.filter((r) => !(r.user_id === user.id && r.emoji === emoji)),
-        {
-          id: crypto.randomUUID(),
-          room_id: roomId,
-          user_id: user.id,
-          emoji,
-          created_at: new Date().toISOString(),
-        },
-      ]);
+      if (messageError) throw messageError;
+
+      // Update messages list to show the reaction
+      const newSystemMessage = {
+        id: `sys-${Date.now()}`,
+        room_id: roomId,
+        sender: "System",
+        text: `${user.email} reacted with ${emoji}`,
+        created_at: new Date().toISOString()
+      };
+      setMessages(prev => [...prev, newSystemMessage]);
+
     } catch (error) {
       console.error("Error sending reaction:", error);
       if (error.code === "23503") {
@@ -1071,8 +963,8 @@ export default function MeetingRoom() {
 
   async function approveUser(uid) {
     try {
-      console.log("Approving user:", uid);
-      const { error } = await supabase
+      // First update the participant status
+      const { error: updateError } = await supabase
         .from("participants")
         .update({
           status: "approved",
@@ -1081,21 +973,46 @@ export default function MeetingRoom() {
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
 
-      if (error) throw error;
-      console.log("User approved successfully");
+      if (updateError) throw updateError;
 
-      if (permitToJoin && peerRef.current?.id) {
-        const { data: signal } = await supabase
+      // Get the newly approved user's peer ID
+      const { data: signal } = await supabase
+        .from("signals")
+        .select("peer_id")
+        .eq("room_id", roomId)
+        .eq("user_id", uid)
+        .single();
+
+      if (signal?.peer_id) {
+        // Connect to the newly approved user
+        await connectToPeer(signal.peer_id);
+        
+        // Notify all other participants to connect to the new user
+        const { data: otherParticipants } = await supabase
           .from("signals")
           .select("peer_id")
           .eq("room_id", roomId)
-          .eq("user_id", uid)
-          .single();
+          .neq("peer_id", signal.peer_id);
 
-        if (signal?.peer_id) {
-          connectToPeer(signal.peer_id);
+        if (otherParticipants?.length > 0) {
+          await Promise.all(
+            otherParticipants.map(async (p) => {
+              try {
+                await supabase
+                  .from("signals")
+                  .update({ last_active: new Date().toISOString() })
+                  .eq("room_id", roomId)
+                  .eq("peer_id", p.peer_id);
+              } catch (err) {
+                console.error("Error notifying participant:", err);
+              }
+            })
+          );
         }
       }
+
+      // Update the participants list
+      await updateParticipants(meetingDbId);
     } catch (error) {
       console.error("Error approving user:", error);
       alert("Failed to approve user. Please try again.");
@@ -1104,7 +1021,6 @@ export default function MeetingRoom() {
 
   async function denyUser(uid) {
     try {
-      console.log("Denying user:", uid);
       const { error } = await supabase
         .from("participants")
         .update({
@@ -1115,7 +1031,6 @@ export default function MeetingRoom() {
         .eq("user_id", uid);
 
       if (error) throw error;
-      console.log("User denied successfully");
     } catch (error) {
       console.error("Error denying user:", error);
       alert("Failed to deny user. Please try again.");
@@ -1126,8 +1041,6 @@ export default function MeetingRoom() {
     if (!isMountedRef.current) return;
 
     try {
-      console.log("Leaving room...");
-
       if (isRecording) await stopRecording();
       
       if (isScreenSharing && screenStreamRef.current) {
@@ -1160,6 +1073,21 @@ export default function MeetingRoom() {
       if (refreshInterval.current) {
         clearInterval(refreshInterval.current);
         refreshInterval.current = null;
+      }
+
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+
+      if (participantUpdateTimeoutRef.current) {
+        clearTimeout(participantUpdateTimeoutRef.current);
+        participantUpdateTimeoutRef.current = null;
       }
 
       if (meetingDbId && user?.id) {
@@ -1206,12 +1134,10 @@ export default function MeetingRoom() {
     }
   }
 
-  // Enhanced room initialization with better error recovery
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
 
     try {
-      console.log("Initializing room...");
       setIsInitialized(true);
 
       const { data: auth, error: authError } = await supabase.auth.getUser();
@@ -1220,7 +1146,6 @@ export default function MeetingRoom() {
       await ensureProfileExists(auth.user.id);
       setUser(auth.user);
 
-      // Retry meeting fetch with exponential backoff
       let mt;
       let retries = 0;
       while (retries < 3) {
@@ -1248,8 +1173,7 @@ export default function MeetingRoom() {
       setIsHost(hostStatus);
       setPasscodeRequired(!!mt.passcode);
 
-      const providedPass =
-        new URLSearchParams(search).get("passcode") || inputPasscode;
+      const providedPass = new URLSearchParams(search).get("passcode") || inputPasscode;
       if (mt.passcode && providedPass !== mt.passcode) {
         setNeedPasscode(true);
         return;
@@ -1257,8 +1181,9 @@ export default function MeetingRoom() {
 
       setNeedPasscode(false);
 
+      loadMessagesAndReactions();
+
       if (hostStatus) {
-        console.log("Setting up host...");
         setPermitToJoin(true);
 
         try {
@@ -1268,11 +1193,9 @@ export default function MeetingRoom() {
           setupParticipantsListener(mt.id);
         } catch (err) {
           console.error("Host setup error:", err);
-          // Attempt recovery
           setTimeout(() => initRoom(), 3000);
         }
       } else {
-        console.log("Checking participant status...");
         let existing;
         try {
           const { data } = await supabase
@@ -1284,15 +1207,11 @@ export default function MeetingRoom() {
           existing = data;
         } catch (err) {
           console.error("Error checking participant status:", err);
-          // Retry after delay
           setTimeout(() => initRoom(), 2000);
           return;
         }
 
-        console.log("Existing participant record:", existing);
-
         if (!existing || existing.status === "pending") {
-          console.log("Participant needs to request access");
           setupParticipantListener(mt.id, auth.user.id);
 
           if (!existing) {
@@ -1301,7 +1220,6 @@ export default function MeetingRoom() {
             setWaitingForApproval(true);
           }
         } else if (existing.status === "approved") {
-          console.log("Already approved, requesting permissions and joining...");
           setPermitToJoin(true);
           try {
             await requestMediaPermissions();
@@ -1309,11 +1227,9 @@ export default function MeetingRoom() {
             setupParticipantsListener(mt.id);
           } catch (err) {
             console.error("Approved participant setup error:", err);
-            // Attempt recovery
             setTimeout(() => initRoom(), 3000);
           }
         } else if (existing.status === "denied") {
-          alert("⛔ Access denied by host.");
           navigate("/");
         }
       }
@@ -1322,19 +1238,15 @@ export default function MeetingRoom() {
       if (isMountedRef.current) {
         setIsInitialized(false);
         alert(error.message || "Failed to initialize room");
-        // Retry initialization after delay
         setTimeout(() => initRoom(), 5000);
       }
     }
   }, [inputPasscode, navigate, roomId, search]);
 
-  // Enhanced joinMeeting function with better connection handling
   async function joinMeeting(meetingId, userId) {
     if (isJoining) return;
     setIsJoining(true);
     setConnectionStatus("Connecting...");
-
-    console.log("Joining meeting...", meetingId, userId);
 
     try {
       const stream = await requestMediaPermissions();
@@ -1344,15 +1256,12 @@ export default function MeetingRoom() {
       peerRef.current = peer;
 
       peer.on("open", async (pid) => {
-        console.log("Peer opened with ID:", pid);
         try {
-          // Update participant names with our own info
           setParticipantNames(prev => ({
             ...prev,
-            [pid]: user?.email || pid.substring(0, 8)
+            [pid]: user?.email || pid
           }));
 
-          // Upsert our signal with retry logic
           let attempts = 0;
           const maxAttempts = 3;
           
@@ -1372,7 +1281,7 @@ export default function MeetingRoom() {
               );
 
               if (error) throw error;
-              break; // Success, exit retry loop
+              break;
             } catch (err) {
               attempts++;
               if (attempts >= maxAttempts) throw err;
@@ -1380,19 +1289,14 @@ export default function MeetingRoom() {
             }
           }
 
-          // Connect to all existing participants with parallel connections
-          const { data: others, error: fetchError } = await supabase
+          const { data: others } = await supabase
             .from("signals")
             .select("*")
             .eq("room_id", roomId)
             .neq("peer_id", pid)
             .order("last_active", { ascending: false });
 
-          if (fetchError) throw fetchError;
-
-          if (others && others.length > 0) {
-            console.log(`Connecting to ${others.length} existing participants`);
-            // Use Promise.all to connect in parallel but limit concurrency
+          if (others?.length > 0) {
             const MAX_CONCURRENT_CONNECTIONS = 3;
             const connectionGroups = [];
             
@@ -1418,12 +1322,10 @@ export default function MeetingRoom() {
                 },
                 (payload) => {
                   if (payload.new.peer_id !== pid) {
-                    console.log("Peer activity change:", payload);
                     if (
                       payload.eventType === "INSERT" ||
                       payload.eventType === "UPDATE"
                     ) {
-                      // Only connect if we don't already have a connection
                       if (!peerConnectionsRef.current[payload.new.peer_id]) {
                         connectToPeer(payload.new.peer_id);
                       }
@@ -1435,14 +1337,12 @@ export default function MeetingRoom() {
               )
               .subscribe((status, err) => {
                 if (err) {
-                  console.error("Signals channel error:", err);
                   setTimeout(() => {
                     if (signalsChannel.current) {
                       signalsChannel.current.subscribe();
                     }
                   }, 2000);
                 }
-                console.log("Signals channel status:", status);
               });
           }
         } catch (err) {
@@ -1456,7 +1356,6 @@ export default function MeetingRoom() {
       });
 
       peer.on("call", (call) => {
-        console.log("Receiving call from:", call.peer);
         try {
           const streamToAnswerWith = isScreenSharing && screenStreamRef.current ? 
             new MediaStream([
@@ -1480,18 +1379,39 @@ export default function MeetingRoom() {
         }
       });
 
-      loadMessagesAndReactions();
       setIsJoining(false);
     } catch (err) {
       console.error("Join meeting error:", err);
       setIsJoining(false);
-      setConnectionStatus("Connection failed");
-      // Attempt recovery
       setTimeout(() => joinMeeting(meetingId, userId), 5000);
     }
   }
 
-  // Effects
+  function setupParticipantsListener(mtId) {
+    if (!participantsChannel.current) {
+      participantsChannel.current = supabase
+        .channel(`participants:${mtId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "participants",
+            filter: `meeting_id=eq.${mtId}`,
+          },
+          (payload) => {
+            if (participantUpdateTimeoutRef.current) {
+              clearTimeout(participantUpdateTimeoutRef.current);
+            }
+            participantUpdateTimeoutRef.current = setTimeout(() => {
+              updateParticipants(mtId);
+            }, 500);
+          }
+        )
+        .subscribe();
+    }
+  }
+
   useEffect(() => {
     const pass = new URLSearchParams(search).get("passcode") || "";
     setInputPasscode(pass);
@@ -1508,7 +1428,6 @@ export default function MeetingRoom() {
       isMountedRef.current = false;
       leaveRoom();
       
-      // Clean up audio context
       if (audioContextRef.current) {
         audioContextRef.current.close();
         audioContextRef.current = null;
@@ -1516,7 +1435,6 @@ export default function MeetingRoom() {
     };
   }, [needPasscode, initRoom]);
 
-  // UI Render
   if (needPasscode) {
     return (
       <div className="p-4 max-w-md mx-auto">
@@ -1542,7 +1460,14 @@ export default function MeetingRoom() {
   }
 
   return (
-    <div className="p-4 space-y-4 max-w-6xl mx-auto">
+    <div className="p-4 space-y-4 max-w-6xl mx-auto relative">
+      {/* Recording Alert */}
+      {showRecordingAlert && (
+        <div className="fixed top-4 left-1/2 transform -translate-x-1/2 bg-black bg-opacity-80 text-white px-4 py-2 rounded-lg z-50">
+          {recordingAlertMessage}
+        </div>
+      )}
+
       <div className="bg-white rounded-lg shadow-sm border p-4">
         <h1 className="text-2xl font-bold mb-4">📹 Meeting Room: {roomId}</h1>
         <div className="flex gap-2">
@@ -1565,16 +1490,14 @@ export default function MeetingRoom() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Main video area */}
         <div className="lg:col-span-2 space-y-4">
-          {/* Local video */}
-          <div className="bg-black rounded-lg overflow-hidden relative">
+          <div className="bg-black rounded-lg overflow-hidden relative aspect-video">
             <video
               ref={localVideoRef}
               autoPlay
               playsInline
               muted
-              className="w-full h-64 object-cover"
+              className="w-full h-full object-cover"
             />
             <div className="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm">
               {user?.email || "You"}
@@ -1588,13 +1511,11 @@ export default function MeetingRoom() {
             }`}></div>
           </div>
 
-          {/* Remote videos */}
           <div
             id="remote-videos"
             className="grid grid-cols-1 sm:grid-cols-2 gap-2"
           />
 
-          {/* Controls */}
           <div className="flex flex-wrap gap-2 justify-center bg-gray-100 p-3 rounded-lg">
             <button
               onClick={toggleMute}
@@ -1643,7 +1564,6 @@ export default function MeetingRoom() {
             </button>
           </div>
 
-          {/* Status */}
           <div className="flex items-center gap-2">
             <div className={`w-3 h-3 rounded-full ${
               connectionStatus === 'Connected' ? 'bg-green-500' : 
@@ -1653,9 +1573,7 @@ export default function MeetingRoom() {
           </div>
         </div>
 
-        {/* Sidebar */}
         <div className="space-y-4">
-          {/* Participants list */}
           {permitToJoin && (
             <div className="bg-white border rounded-lg p-3">
               <h3 className="font-bold mb-2">👥 Participants ({participants.length})</h3>
@@ -1663,7 +1581,7 @@ export default function MeetingRoom() {
                 {participants.map((participantId) => (
                   <div key={participantId} className="flex items-center p-2 bg-gray-50 rounded">
                     <span className="text-sm truncate">
-                      {participantNames[participantId] || participantId.substring(0, 8)}
+                      {participantNames[participantId] || participantId}
                     </span>
                     {participantId === user?.id && (
                       <span className="ml-2 text-xs text-gray-500">(You)</span>
@@ -1677,7 +1595,6 @@ export default function MeetingRoom() {
             </div>
           )}
 
-          {/* Waiting list (host only) */}
           {isHost && waitingList.length > 0 && (
             <div className="bg-white border rounded-lg p-3">
               <h3 className="font-bold mb-2">👥 Waiting Room ({waitingList.length})</h3>
@@ -1707,7 +1624,6 @@ export default function MeetingRoom() {
             </div>
           )}
 
-          {/* Waiting for approval */}
           {waitingForApproval && (
             <div className="bg-yellow-100 border border-yellow-300 rounded-lg p-4">
               <p className="text-yellow-800">
@@ -1716,7 +1632,6 @@ export default function MeetingRoom() {
             </div>
           )}
 
-          {/* Chat */}
           <div className={`bg-white border rounded-lg ${showChat ? 'block' : 'hidden'}`}>
             <div className="p-3 border-b flex justify-between items-center">
               <h3 className="font-bold">💬 Chat</h3>
@@ -1753,7 +1668,6 @@ export default function MeetingRoom() {
             </div>
           </div>
 
-          {/* Reactions */}
           <div className="bg-white border rounded-lg p-3">
             <h3 className="font-bold mb-2">🎉 Reactions</h3>
             <div className="flex flex-wrap gap-2 mb-3">
@@ -1776,7 +1690,6 @@ export default function MeetingRoom() {
             </div>
           </div>
 
-          {/* Chat toggle */}
           {!showChat && (
             <button
               onClick={() => setShowChat(true)}
