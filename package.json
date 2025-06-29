@@ -12,6 +12,7 @@
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^13.4.0",
     "@testing-library/user-event": "^13.5.0",
+    "core-js-pure": "^3.43.0",
     "debug": "^4.4.1",
     "peerjs": "^1.5.5",
     "react": "^18.2.0",

@@ -4,8 +4,20 @@ import Peer from "peerjs";
 import RecordRTC from "recordrtc";
 import { supabase } from "../supabaseClient";
 
-export default function MeetingRoom() {
-  // State declarations
+// Utility function to get a stable peer ID for reconnections
+const getStablePeerId = (userId) => {
+  const storedId = sessionStorage.getItem(`peerId-${userId}`);
+  if (storedId) return storedId;
+
+  const newId = `peer-${userId}-${Math.random().toString(36).substr(2, 9)}`;
+  sessionStorage.setItem(`peerId-${userId}`, newId);
+  return newId;
+};
+
+// Auto-refresh interval in milliseconds
+const AUTO_REFRESH_INTERVAL = 1000;
+
+export default function MeetingRoom(){  // State declarations
   const { roomId } = useParams();
   const navigate = useNavigate();
   const { search } = useLocation();
@@ -38,6 +50,12 @@ export default function MeetingRoom() {
   const [showRecordingAlert, setShowRecordingAlert] = useState(false);
   const [recordingAlertMessage, setRecordingAlertMessage] = useState("");
   const [autoReconnectAttempts, setAutoReconnectAttempts] = useState(0);
+  const [isMobile, setIsMobile] = useState(false);
+  const [reconnectionState, setReconnectionState] = useState({
+    isReconnecting: false,
+    attempts: 0,
+  });
+  const [lastRefreshTime, setLastRefreshTime] = useState(Date.now());
 
   // Refs
   const peerRef = useRef();
@@ -56,6 +74,10 @@ export default function MeetingRoom() {
   const recordingTimerRef = useRef();
   const reconnectTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
+  const pendingPeerConnections = useRef(new Set());
+  const activePeerConnections = useRef(new Set());
+  const screenShareContainerRef = useRef(null);
+  const autoRefreshIntervalRef = useRef();
 
   // Supabase channels
   const waitingChannel = useRef();
@@ -70,8 +92,84 @@ export default function MeetingRoom() {
     passcodeRequired ? `?passcode=${encodeURIComponent(inputPasscode)}` : ""
   }`;
 
+  // Auto-refresh function
+  const refreshMeetingState = useCallback(async () => {
+    if (!isMountedRef.current || !meetingDbId || !user?.id) return;
+
+    try {
+      setLastRefreshTime(Date.now());
+
+      // Refresh participants list
+      if (permitToJoin) {
+        await updateParticipants(meetingDbId);
+      }
+
+      // Refresh waiting list if host
+      if (isHost) {
+        await updateWaitingList(meetingDbId);
+      }
+
+      // Refresh peer connections
+      if (peerRef.current?.id) {
+        const { data: others } = await supabase
+          .from("signals")
+          .select("peer_id, user_id")
+          .eq("room_id", roomId)
+          .neq("peer_id", peerRef.current.id);
+
+        if (others?.length > 0) {
+          others.forEach(({ peer_id }) => {
+            if (!peerConnectionsRef.current[peer_id] && !pendingPeerConnections.current.has(peer_id)) {
+              connectToPeer(peer_id);
+            }
+          });
+        }
+      }
+
+      // Update connection status
+      if (peerRef.current) {
+        if (peerRef.current.disconnected) {
+          setConnectionStatus("Reconnecting...");
+          peerRef.current.reconnect();
+        } else if (peerRef.current.open) {
+          setConnectionStatus("Connected");
+        }
+      }
+    } catch (error) {
+      console.error("Auto-refresh error:", error);
+    }
+  }, [meetingDbId, user?.id, permitToJoin, isHost, roomId]);
+
+  // Setup auto-refresh interval
+  useEffect(() => {
+    if (permitToJoin && !autoRefreshIntervalRef.current) {
+      autoRefreshIntervalRef.current = setInterval(() => {
+        refreshMeetingState();
+      }, AUTO_REFRESH_INTERVAL);
+    }
+
+    return () => {
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+    };
+  }, [permitToJoin, refreshMeetingState]);
+
+  // Check if mobile device
+  useEffect(() => {
+    const checkIfMobile = () => {
+      const isMobileDevice =
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+          navigator.userAgent
+        );
+      setIsMobile(isMobileDevice);
+    };
+    checkIfMobile();
+  }, []);
+
   // Helper functions
-  async function ensureProfileExists(userId) {
+  const ensureProfileExists = async (userId) => {
     const {
       data: { user },
       error: authError,
@@ -83,9 +181,9 @@ export default function MeetingRoom() {
       .upsert({ id: userId, email: user.email }, { onConflict: "id" });
 
     if (error) throw error;
-  }
+  };
 
-  async function createPendingRequest(meetingId, userId) {
+  const createPendingRequest = async (meetingId, userId) => {
     try {
       await ensureProfileExists(userId);
 
@@ -105,9 +203,9 @@ export default function MeetingRoom() {
       console.error("Error in createPendingRequest:", error);
       alert("Failed to create join request. Please try again.");
     }
-  }
+  };
 
-  function setupWaitingListener(mtId) {
+  const setupWaitingListener = (mtId) => {
     updateWaitingList(mtId);
 
     if (!waitingChannel.current) {
@@ -127,9 +225,9 @@ export default function MeetingRoom() {
         )
         .subscribe();
     }
-  }
+  };
 
-  function setupParticipantListener(mtId, uid) {
+  const setupParticipantListener = (mtId, uid) => {
     if (!participantListener.current) {
       participantListener.current = supabase
         .channel(`participant:${mtId}:${uid}`)
@@ -148,7 +246,7 @@ export default function MeetingRoom() {
               try {
                 await requestMediaPermissions();
                 await joinMeeting(mtId, uid);
-                
+
                 if (peerRef.current?.id) {
                   const { data: others } = await supabase
                     .from("signals")
@@ -157,8 +255,10 @@ export default function MeetingRoom() {
                     .neq("peer_id", peerRef.current.id);
 
                   if (others?.length > 0) {
-                    await Promise.all(others.map(({ peer_id }) => connectToPeer(peer_id)));
-                    
+                    await Promise.all(
+                      others.map(({ peer_id }) => connectToPeer(peer_id))
+                    );
+
                     // Update last_active to trigger connection from others
                     await supabase
                       .from("signals")
@@ -178,27 +278,30 @@ export default function MeetingRoom() {
         )
         .subscribe();
     }
-  }
+  };
 
-  async function updateParticipants(mtId) {
+  const updateParticipants = async (mtId) => {
     try {
       const { data } = await supabase
         .from("participants")
         .select("user_id, profiles:user_id(email)")
         .eq("meeting_id", mtId)
         .eq("status", "approved");
-      
+
       if (data) {
         setParticipants(data.map((p) => p.user_id));
-        
+
         const names = {};
-        data.forEach(p => {
+        data.forEach((p) => {
           names[p.user_id] = p.profiles?.email || p.user_id;
         });
         setParticipantNames(names);
-        
-        Object.keys(remoteVideosRef.current).forEach(peerId => {
-          const label = remoteVideosRef.current[peerId]?.querySelector('.participant-label');
+
+        Object.keys(remoteVideosRef.current).forEach((peerId) => {
+          const label =
+            remoteVideosRef.current[peerId]?.querySelector(
+              ".participant-label"
+            );
           if (label) {
             label.textContent = names[peerId] || peerId;
           }
@@ -207,9 +310,9 @@ export default function MeetingRoom() {
     } catch (error) {
       console.error("Error updating participants:", error);
     }
-  }
+  };
 
-  async function updateWaitingList(mtId) {
+  const updateWaitingList = async (mtId) => {
     try {
       const { data } = await supabase
         .from("participants")
@@ -222,9 +325,9 @@ export default function MeetingRoom() {
     } catch (error) {
       console.error("Error in updateWaitingList:", error);
     }
-  }
+  };
 
-  async function requestMediaPermissions() {
+  const requestMediaPermissions = async () => {
     if (localStreamRef.current) return localStreamRef.current;
 
     try {
@@ -232,13 +335,14 @@ export default function MeetingRoom() {
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
+          autoGainControl: true,
         },
         video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30 }
-        }
+          width: { ideal: isMobile ? 640 : 1280 },
+          height: { ideal: isMobile ? 480 : 720 },
+          frameRate: { ideal: isMobile ? 15 : 30 },
+          facingMode: isMobile ? "user" : "environment",
+        },
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -246,6 +350,10 @@ export default function MeetingRoom() {
 
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+        // Mirror video for front-facing camera on mobile
+        if (isMobile) {
+          localVideoRef.current.style.transform = "scaleX(-1)";
+        }
       }
 
       stream.getAudioTracks().forEach((track) => (track.enabled = !isMuted));
@@ -253,77 +361,99 @@ export default function MeetingRoom() {
 
       setMediaPermissionGranted(true);
       setupAudioContext(stream);
-      
+
       return stream;
     } catch (err) {
       console.error("Media permission error:", err);
       try {
-        const fallbackStream = await navigator.mediaDevices.getUserMedia({
+        const fallbackConstraints = {
           audio: true,
-          video: true
-        });
-        
+          video: {
+            width: { min: 320, ideal: 640, max: 1280 },
+            height: { min: 240, ideal: 480, max: 720 },
+            frameRate: { ideal: 15 },
+          },
+        };
+
+        const fallbackStream = await navigator.mediaDevices.getUserMedia(
+          isMobile ? { audio: true, video: true } : fallbackConstraints
+        );
+
         localStreamRef.current = fallbackStream;
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = fallbackStream;
+          if (isMobile) {
+            localVideoRef.current.style.transform = "scaleX(-1)";
+          }
         }
-        
+
         setMediaPermissionGranted(true);
         return fallbackStream;
       } catch (fallbackError) {
         console.error("Fallback media error:", fallbackError);
-        throw fallbackError;
+        // Handle cases where only audio is available
+        try {
+          const audioOnlyStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+          localStreamRef.current = audioOnlyStream;
+          setMediaPermissionGranted(true);
+          return audioOnlyStream;
+        } catch (audioError) {
+          console.error("Audio only fallback failed:", audioError);
+          throw audioError;
+        }
       }
     }
-  }
+  };
 
-  function setupAudioContext(stream) {
+  const setupAudioContext = (stream) => {
     try {
       if (!audioContextRef.current) {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         audioContextRef.current = new AudioContext();
       }
-      
+
       const audioContext = audioContextRef.current;
       const source = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 512;
       source.connect(analyser);
-      
-      analysersRef.current['local'] = analyser;
+
+      analysersRef.current["local"] = analyser;
       analyzeAudio();
     } catch (err) {
       console.error("Audio context setup error:", err);
     }
-  }
+  };
 
-  function analyzeAudio() {
+  const analyzeAudio = () => {
     if (!isMountedRef.current) return;
-    
-    const bufferLength = analysersRef.current['local']?.frequencyBinCount || 0;
+
+    const bufferLength = analysersRef.current["local"]?.frequencyBinCount || 0;
     const dataArray = new Uint8Array(bufferLength);
-    const newActiveSpeakers = {...activeSpeakers};
-    
-    if (analysersRef.current['local']) {
-      analysersRef.current['local'].getByteFrequencyData(dataArray);
+    const newActiveSpeakers = { ...activeSpeakers };
+
+    if (analysersRef.current["local"]) {
+      analysersRef.current["local"].getByteFrequencyData(dataArray);
       const volume = Math.max(...dataArray);
-      newActiveSpeakers['local'] = volume > 30;
+      newActiveSpeakers["local"] = volume > 30;
     }
-    
-    Object.keys(analysersRef.current).forEach(peerId => {
-      if (peerId !== 'local') {
+
+    Object.keys(analysersRef.current).forEach((peerId) => {
+      if (peerId !== "local") {
         analysersRef.current[peerId].getByteFrequencyData(dataArray);
         const volume = Math.max(...dataArray);
         newActiveSpeakers[peerId] = volume > 30;
       }
     });
-    
+
     setActiveSpeakers(newActiveSpeakers);
     requestAnimationFrame(analyzeAudio);
-  }
+  };
 
   const toggleScreenShare = async () => {
-  try {
+    try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
       });
@@ -353,42 +483,43 @@ export default function MeetingRoom() {
     } catch {
       alert("Screen share failed.");
     }
-};
 
-  function updateAllPeerConnections(stream) {
-    if (!peerRef.current) return;
+  };
 
-    Object.keys(peerRef.current.connections).forEach(peerId => {
-      peerRef.current.connections[peerId].forEach(connection => {
+  const updateAllPeerConnections = (stream) => {
+    if (!peerRef.current || !stream) return;
+
+    Object.keys(peerRef.current.connections).forEach((peerId) => {
+      peerRef.current.connections[peerId].forEach((connection) => {
         if (connection.peerConnection?.getSenders) {
           const senders = connection.peerConnection.getSenders();
           const videoTrack = stream.getVideoTracks()[0];
           const audioTrack = stream.getAudioTracks()[0];
-          
-          senders.forEach(sender => {
-            if (sender.track.kind === 'video' && videoTrack) {
+
+          senders.forEach((sender) => {
+            if (sender.track.kind === "video" && videoTrack) {
               sender.replaceTrack(videoTrack).catch(console.error);
-            } else if (sender.track.kind === 'audio' && audioTrack) {
+            } else if (sender.track.kind === "audio" && audioTrack) {
               sender.replaceTrack(audioTrack).catch(console.error);
             }
           });
         }
       });
     });
-  }
+  };
 
-  function toggleMute() {
+  const toggleMute = () => {
     if (localStreamRef.current) {
       const audioTracks = localStreamRef.current.getAudioTracks();
       const newMuteState = !isMuted;
       audioTracks.forEach((track) => {
-        track.enabled = newMuteState;
+        track.enabled = !newMuteState;
       });
       setIsMuted(newMuteState);
     }
-  }
+  };
 
-  function toggleCamera() {
+  const toggleCamera = () => {
     if (localStreamRef.current) {
       const videoTracks = localStreamRef.current.getVideoTracks();
       const newCameraState = !cameraOn;
@@ -397,22 +528,23 @@ export default function MeetingRoom() {
       });
       setCameraOn(newCameraState);
     }
-  }
+  };
 
-  async function startRecording() {
+  const startRecording = async () => {
     if (!localStreamRef.current) {
       alert("Please join the meeting first to start recording.");
       return;
     }
     try {
       const combinedStream = new MediaStream();
-      
-      const videoSource = isScreenSharing && screenStreamRef.current ? 
-        screenStreamRef.current.getVideoTracks()[0] : 
-        localStreamRef.current.getVideoTracks()[0];
-      
+
+      const videoSource =
+        isScreenSharing && screenStreamRef.current
+          ? screenStreamRef.current.getVideoTracks()[0]
+          : localStreamRef.current.getVideoTracks()[0];
+
       const audioSource = localStreamRef.current.getAudioTracks()[0];
-      
+
       if (videoSource) combinedStream.addTrack(videoSource);
       if (audioSource) combinedStream.addTrack(audioSource);
 
@@ -421,17 +553,17 @@ export default function MeetingRoom() {
         mimeType: "video/webm;codecs=vp9",
         bitsPerSecond: 1280000,
         videoBitsPerSecond: 1000000,
-        audioBitsPerSecond: 128000
+        audioBitsPerSecond: 128000,
       });
-      
+
       recorder.startRecording();
       recorderRef.current = recorder;
       setIsRecording(true);
-      
+
       setRecordingAlertMessage("Recording started");
       setShowRecordingAlert(true);
       setTimeout(() => setShowRecordingAlert(false), 3000);
-      
+
       let seconds = 0;
       recordingTimerRef.current = setInterval(() => {
         seconds++;
@@ -441,40 +573,44 @@ export default function MeetingRoom() {
       console.error("Recording start error:", err);
       alert("Failed to start recording.");
     }
-  }
+  };
 
-  function formatTime(seconds) {
+  const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  }
+    return `${mins.toString().padStart(2, "0")}:${secs
+      .toString()
+      .padStart(2, "0")}`;
+  };
 
-  async function stopRecording() {
+  const stopRecording = async () => {
     if (!recorderRef.current) return;
     try {
       clearInterval(recordingTimerRef.current);
-      
+
       await new Promise((resolve) => {
         recorderRef.current.stopRecording(resolve);
       });
-      
+
       const blob = recorderRef.current.getBlob();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
       const filename = `recording-${roomId}-${timestamp}.webm`;
-      
+
       const { data, error } = await supabase.storage
         .from("recordings")
         .upload(`public/${filename}`, blob, {
-          contentType: 'video/webm',
-          upsert: false
+          contentType: "video/webm",
+          upsert: false,
         });
-      
+
       if (error) throw error;
-      
-      const { data: { publicUrl } } = supabase.storage
+
+      const {
+        data: { publicUrl },
+      } = supabase.storage
         .from("recordings")
         .getPublicUrl(`public/${filename}`);
-      
+
       const { data: userData } = await supabase.auth.getUser();
       await supabase.from("recordings").insert({
         room_id: roomId,
@@ -483,12 +619,12 @@ export default function MeetingRoom() {
         file_url: publicUrl,
         file_size: blob.size,
         duration: Math.floor(recorderRef.current.getBlob().duration),
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
       });
-      
+
       setIsRecording(false);
       recorderRef.current = null;
-      
+
       setRecordingAlertMessage("Recording saved successfully");
       setShowRecordingAlert(true);
       setTimeout(() => setShowRecordingAlert(false), 3000);
@@ -500,10 +636,11 @@ export default function MeetingRoom() {
       setShowRecordingAlert(true);
       setTimeout(() => setShowRecordingAlert(false), 3000);
     }
-  }
+  };
 
-  const createPeer = () => {
-    const peer = new Peer({
+  const createPeer = (userId) => {
+    const peerId = getStablePeerId(userId);
+    const peer = new Peer(peerId, {
       debug: 3,
       config: {
         iceServers: [
@@ -513,14 +650,14 @@ export default function MeetingRoom() {
           {
             urls: "turn:global.turn.twilio.com:3478?transport=udp",
             username: "your-twilio-username",
-            credential: "your-twilio-credential"
-          }
+            credential: "your-twilio-credential",
+          },
         ],
         iceTransportPolicy: "all",
         iceCandidatePoolSize: 5,
         rtcpMuxPolicy: "require",
         bundlePolicy: "max-bundle",
-        sdpSemantics: "unified-plan"
+        sdpSemantics: "unified-plan",
       },
       reconnectTimer: 5000,
     });
@@ -576,9 +713,11 @@ export default function MeetingRoom() {
   };
 
   const reconnectPeers = async () => {
-    if (!peerRef.current?.id) return;
+    if (!peerRef.current?.id || reconnectionState.isReconnecting) return;
 
     try {
+      setReconnectionState({ isReconnecting: true, attempts: 0 });
+
       const { data: others } = await supabase
         .from("signals")
         .select("peer_id, user_id")
@@ -588,41 +727,69 @@ export default function MeetingRoom() {
       if (others?.length > 0) {
         const MAX_CONCURRENT_CONNECTIONS = 3;
         const connectionGroups = [];
-        
+
         for (let i = 0; i < others.length; i += MAX_CONCURRENT_CONNECTIONS) {
-          connectionGroups.push(others.slice(i, i + MAX_CONCURRENT_CONNECTIONS));
+          connectionGroups.push(
+            others.slice(i, i + MAX_CONCURRENT_CONNECTIONS)
+          );
         }
-        
+
         for (const group of connectionGroups) {
-          await Promise.all(group.map(o => connectToPeer(o.peer_id)));
+          await Promise.all(group.map((o) => connectToPeer(o.peer_id)));
         }
       }
+
+      setReconnectionState({ isReconnecting: false, attempts: 0 });
     } catch (error) {
       console.error("Reconnection error:", error);
+      const nextAttempt = reconnectionState.attempts + 1;
+      if (nextAttempt <= 5) {
+        setTimeout(() => {
+          reconnectPeers();
+        }, Math.min(5000, 1000 * nextAttempt));
+        setReconnectionState({ isReconnecting: true, attempts: nextAttempt });
+      } else {
+        setReconnectionState({ isReconnecting: false, attempts: 0 });
+      }
     }
   };
 
   const connectToPeer = async (peerId) => {
     if (!peerRef.current || !localStreamRef.current) return;
 
-    if (peerConnectionsRef.current[peerId]) return;
+    if (pendingPeerConnections.current.has(peerId)) return;
 
-    if (!retryCountsRef.current[peerId]) {
-      retryCountsRef.current[peerId] = 0;
-    }
-
-    if (retryCountsRef.current[peerId] >= 5) return;
+    pendingPeerConnections.current.add(peerId);
 
     try {
-      const streamToSend = isScreenSharing && screenStreamRef.current ? 
-        new MediaStream([
-          ...screenStreamRef.current.getVideoTracks(),
-          ...localStreamRef.current.getAudioTracks()
-        ]) : 
-        localStreamRef.current;
+      if (peerConnectionsRef.current[peerId]) {
+        const existingConnection = peerConnectionsRef.current[peerId];
+        if (existingConnection.open) {
+          pendingPeerConnections.current.delete(peerId);
+          return;
+        }
+      }
+
+      if (!retryCountsRef.current[peerId]) {
+        retryCountsRef.current[peerId] = 0;
+      }
+
+      if (retryCountsRef.current[peerId] >= 5) {
+        pendingPeerConnections.current.delete(peerId);
+        return;
+      }
+
+      const streamToSend =
+        isScreenSharing && screenStreamRef.current
+          ? new MediaStream([
+              ...screenStreamRef.current.getVideoTracks(),
+              ...localStreamRef.current.getAudioTracks(),
+            ])
+          : localStreamRef.current;
 
       const call = peerRef.current.call(peerId, streamToSend);
       peerConnectionsRef.current[peerId] = call;
+      activePeerConnections.current.add(peerId);
       setupCall(call, peerId);
 
       retryCountsRef.current[peerId] = 0;
@@ -630,9 +797,15 @@ export default function MeetingRoom() {
       console.error(`Connection attempt failed to ${peerId}:`, err);
       retryCountsRef.current[peerId] += 1;
       delete peerConnectionsRef.current[peerId];
+      activePeerConnections.current.delete(peerId);
 
-      const delay = Math.min(1000 * Math.pow(2, retryCountsRef.current[peerId]), 8000);
+      const delay = Math.min(
+        1000 * Math.pow(2, retryCountsRef.current[peerId]),
+        8000
+      );
       setTimeout(() => connectToPeer(peerId), delay);
+    } finally {
+      pendingPeerConnections.current.delete(peerId);
     }
   };
 
@@ -642,17 +815,18 @@ export default function MeetingRoom() {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         audioContextRef.current = new AudioContext();
       }
-      
+
       const analyser = audioContextRef.current.createAnalyser();
       analyser.fftSize = 512;
-      const source = audioContextRef.current.createMediaStreamSource(remoteStream);
+      const source =
+        audioContextRef.current.createMediaStreamSource(remoteStream);
       source.connect(analyser);
       analysersRef.current[peerId] = analyser;
-      
+
       addRemote(peerId, remoteStream);
       setConnectionStatus("Connected");
       setAutoReconnectAttempts(0);
-      
+
       if (!statsIntervalRef.current) {
         startConnectionStats();
       }
@@ -661,6 +835,7 @@ export default function MeetingRoom() {
     call.on("close", () => {
       removeRemote(peerId);
       delete peerConnectionsRef.current[peerId];
+      activePeerConnections.current.delete(peerId);
       setConnectionStatus("Disconnected");
       delete analysersRef.current[peerId];
     });
@@ -669,6 +844,7 @@ export default function MeetingRoom() {
       console.error("Call error with", peerId, ":", err);
       removeRemote(peerId);
       delete peerConnectionsRef.current[peerId];
+      activePeerConnections.current.delete(peerId);
       setConnectionStatus("Error: " + err.message);
       delete analysersRef.current[peerId];
     });
@@ -680,52 +856,58 @@ export default function MeetingRoom() {
     });
   };
 
-  function startConnectionStats() {
+  const startConnectionStats = () => {
     if (statsIntervalRef.current) return;
 
     statsIntervalRef.current = setInterval(() => {
       if (!peerRef.current) return;
 
       const stats = {};
-      
+
       Object.entries(peerConnectionsRef.current).forEach(([peerId, call]) => {
         if (call.peerConnection) {
-          call.peerConnection.getStats().then(results => {
-            results.forEach(report => {
-              if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                stats[peerId] = {
-                  rtt: report.currentRoundTripTime,
-                  packetsLost: report.packetsLost,
-                  bytesSent: report.bytesSent,
-                  bytesReceived: report.bytesReceived
-                };
-              }
-            });
-            setConnectionStats(stats);
-          }).catch(console.error);
+          call.peerConnection
+            .getStats()
+            .then((results) => {
+              results.forEach((report) => {
+                if (
+                  report.type === "candidate-pair" &&
+                  report.state === "succeeded"
+                ) {
+                  stats[peerId] = {
+                    rtt: report.currentRoundTripTime,
+                    packetsLost: report.packetsLost,
+                    bytesSent: report.bytesSent,
+                    bytesReceived: report.bytesReceived,
+                  };
+                }
+              });
+              setConnectionStats(stats);
+            })
+            .catch(console.error);
         }
       });
     }, 5000);
-  }
+  };
 
-  function addRemote(id, stream) {
+  const addRemote = (id, stream) => {
     if (remoteVideosRef.current[id]) return;
 
     const div = document.createElement("div");
     div.className = "relative bg-black rounded-lg overflow-hidden";
     div.id = `remote-${id}`;
-    
+
     const vid = document.createElement("video");
     vid.srcObject = stream;
     vid.autoplay = true;
     vid.playsInline = true;
     vid.className = "w-full h-full object-cover";
-    
+
     if (!audioContextRef.current) {
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       audioContextRef.current = new AudioContext();
     }
-    
+
     const analyser = audioContextRef.current.createAnalyser();
     analyser.fftSize = 512;
     const source = audioContextRef.current.createMediaStreamSource(stream);
@@ -733,15 +915,18 @@ export default function MeetingRoom() {
     analysersRef.current[id] = analyser;
 
     const label = document.createElement("div");
-    label.className = "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+    label.className =
+      "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
     label.textContent = participantNames[id] || id;
-    
+
     const speakingIndicator = document.createElement("div");
-    speakingIndicator.className = "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
+    speakingIndicator.className =
+      "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
     speakingIndicator.id = `speaking-${id}`;
 
     const statsElement = document.createElement("div");
-    statsElement.className = "absolute top-2 left-2 bg-black bg-opacity-50 text-white text-xs px-1 rounded";
+    statsElement.className =
+      "absolute top-2 left-2 bg-black bg-opacity-50 text-white text-xs px-1 rounded";
     statsElement.id = `stats-${id}`;
 
     div.appendChild(vid);
@@ -752,46 +937,48 @@ export default function MeetingRoom() {
 
     const container = document.getElementById("remote-videos");
     if (container) container.appendChild(div);
-    
+
     const updateUIElements = () => {
       if (!isMountedRef.current) return;
-      
+
       const indicator = document.getElementById(`speaking-${id}`);
       if (indicator) {
         indicator.className = `absolute top-2 right-2 w-3 h-3 rounded-full ${
-          activeSpeakers[id] ? 'bg-green-500' : 'bg-transparent'
+          activeSpeakers[id] ? "bg-green-500" : "bg-transparent"
         }`;
       }
-      
+
       const statsDisplay = document.getElementById(`stats-${id}`);
       if (statsDisplay && connectionStats[id]) {
         const { rtt, packetsLost } = connectionStats[id];
-        statsDisplay.textContent = `${Math.round(rtt * 1000)}ms ${packetsLost > 0 ? '⚠️' : ''}`;
+        statsDisplay.textContent = `${Math.round(rtt * 1000)}ms ${
+          packetsLost > 0 ? "⚠️" : ""
+        }`;
       }
-      
+
       requestAnimationFrame(updateUIElements);
     };
-    
-    updateUIElements();
-  }
 
-  function removeRemote(id) {
+    updateUIElements();
+  };
+
+  const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
     if (el) {
       el.remove();
       delete remoteVideosRef.current[id];
     }
-    
+
     if (analysersRef.current[id]) {
       delete analysersRef.current[id];
     }
-    
+
     if (peerConnectionsRef.current[id]) {
       delete peerConnectionsRef.current[id];
     }
-  }
+  };
 
-  async function loadMessagesAndReactions() {
+  const loadMessagesAndReactions = async () => {
     try {
       const { data: oldMsgs } = await supabase
         .from("messages")
@@ -842,7 +1029,9 @@ export default function MeetingRoom() {
                 if (payload.eventType === "INSERT") {
                   setReactions((prev) => [...prev, payload.new]);
                 } else if (payload.eventType === "DELETE") {
-                  setReactions((prev) => prev.filter((r) => r.id !== payload.old.id));
+                  setReactions((prev) =>
+                    prev.filter((r) => r.id !== payload.old.id)
+                  );
                 }
               } catch (e) {
                 console.error("Error processing reaction update:", e);
@@ -862,42 +1051,42 @@ export default function MeetingRoom() {
     } catch (error) {
       console.error("Error loading messages and reactions:", error);
     }
-  }
+  };
 
-  async function sendMessage() {
-    if (!chatInput.trim() || !user?.email) return;
-    
-    const tempId = Date.now().toString();
-    const newMessage = {
-      id: tempId,
+  const sendMessage = async () => {
+  if (!chatInput.trim() || !user?.email) return;
+
+  const tempId = Date.now().toString();
+  const newMessage = {
+    id: tempId,
+    room_id: roomId,
+    sender: user.email,
+    text: chatInput,
+    created_at: new Date().toISOString(),
+  };
+
+  setMessages((prev) => [...prev, newMessage]);
+  setChatInput("");
+
+  try {
+    const { error } = await supabase.from("messages").insert({
       room_id: roomId,
       sender: user.email,
       text: chatInput,
-      created_at: new Date().toISOString()
-    };
-    
-    setMessages(prev => [...prev, newMessage]);
-    setChatInput("");
-    
-    try {
-      const { error } = await supabase.from("messages").insert({
-        room_id: roomId,
-        sender: user.email,
-        text: chatInput,
-        created_at: new Date().toISOString(),
-      });
+      created_at: new Date().toISOString(),
+    });
 
-      if (error) {
-        setMessages(prev => prev.filter(msg => msg.id !== tempId));
-        throw error;
-      }
-    } catch (error) {
-      console.error("Error sending message:", error);
-      alert("Failed to send message. Please try again.");
+    if (error) {
+      setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
+      throw error;
     }
+  } catch (error) {
+    console.error("Error sending message:", error);
+    alert("Failed to send message. Please try again.");
   }
+};
 
-  async function sendReaction(emoji) {
+  const sendReaction = async (emoji) => {
     if (!user?.id || !roomId) return;
     if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
 
@@ -907,10 +1096,10 @@ export default function MeetingRoom() {
       room_id: roomId,
       user_id: user.id,
       emoji,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
     };
-    
-    setReactions(prev => [...prev, newReaction]);
+
+    setReactions((prev) => [...prev, newReaction]);
 
     try {
       const { error: profileError } = await supabase
@@ -927,7 +1116,7 @@ export default function MeetingRoom() {
       });
 
       if (error) {
-        setReactions(prev => prev.filter(r => r.id !== tempId));
+        setReactions((prev) => prev.filter((r) => r.id !== tempId));
         throw error;
       }
 
@@ -947,10 +1136,9 @@ export default function MeetingRoom() {
         room_id: roomId,
         sender: "System",
         text: `${user.email} reacted with ${emoji}`,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
       };
-      setMessages(prev => [...prev, newSystemMessage]);
-
+      setMessages((prev) => [...prev, newSystemMessage]);
     } catch (error) {
       console.error("Error sending reaction:", error);
       if (error.code === "23503") {
@@ -959,9 +1147,9 @@ export default function MeetingRoom() {
         alert(`Failed to send reaction: ${error.message}`);
       }
     }
-  }
+  };
 
-  async function approveUser(uid) {
+  const approveUser = async (uid) => {
     try {
       // First update the participant status
       const { error: updateError } = await supabase
@@ -986,7 +1174,7 @@ export default function MeetingRoom() {
       if (signal?.peer_id) {
         // Connect to the newly approved user
         await connectToPeer(signal.peer_id);
-        
+
         // Notify all other participants to connect to the new user
         const { data: otherParticipants } = await supabase
           .from("signals")
@@ -1017,9 +1205,9 @@ export default function MeetingRoom() {
       console.error("Error approving user:", error);
       alert("Failed to approve user. Please try again.");
     }
-  }
+  };
 
-  async function denyUser(uid) {
+  const denyUser = async (uid) => {
     try {
       const { error } = await supabase
         .from("participants")
@@ -1035,18 +1223,23 @@ export default function MeetingRoom() {
       console.error("Error denying user:", error);
       alert("Failed to deny user. Please try again.");
     }
-  }
+  };
 
-  async function leaveRoom() {
+  const leaveRoom = async () => {
     if (!isMountedRef.current) return;
 
     try {
       if (isRecording) await stopRecording();
-      
+
       if (isScreenSharing && screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach(track => track.stop());
+        screenStreamRef.current.getTracks().forEach((track) => track.stop());
         screenStreamRef.current = null;
         setIsScreenSharing(false);
+      }
+
+      if (screenShareContainerRef.current) {
+        screenShareContainerRef.current.remove();
+        screenShareContainerRef.current = null;
       }
 
       if (peerRef.current?.id) {
@@ -1090,6 +1283,11 @@ export default function MeetingRoom() {
         participantUpdateTimeoutRef.current = null;
       }
 
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+
       if (meetingDbId && user?.id) {
         await supabase
           .from("participants")
@@ -1104,15 +1302,15 @@ export default function MeetingRoom() {
       setMediaPermissionGranted(false);
       setPermitToJoin(false);
       setWaitingForApproval(false);
-      
+
       navigate("/");
     } catch (err) {
       console.warn("Leave room error:", err);
       navigate("/");
     }
-  }
+  };
 
-  async function cleanupSubscriptions() {
+  const cleanupSubscriptions = async () => {
     try {
       const channels = [
         signalsChannel,
@@ -1120,7 +1318,7 @@ export default function MeetingRoom() {
         participantListener,
         messagesChannel,
         reactionsChannel,
-        participantsChannel
+        participantsChannel,
       ];
 
       for (const channelRef of channels) {
@@ -1132,7 +1330,7 @@ export default function MeetingRoom() {
     } catch (error) {
       console.warn("Error cleaning up subscriptions:", error);
     }
-  }
+  };
 
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
@@ -1155,16 +1353,16 @@ export default function MeetingRoom() {
             .select("*")
             .eq("room_id", roomId)
             .maybeSingle();
-          
+
           if (error) throw error;
           if (!data) throw new Error("Meeting not found");
-          
+
           mt = data;
           break;
         } catch (err) {
           retries++;
           if (retries >= 3) throw err;
-          await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+          await new Promise((resolve) => setTimeout(resolve, 1000 * retries));
         }
       }
 
@@ -1173,7 +1371,8 @@ export default function MeetingRoom() {
       setIsHost(hostStatus);
       setPasscodeRequired(!!mt.passcode);
 
-      const providedPass = new URLSearchParams(search).get("passcode") || inputPasscode;
+      const providedPass =
+        new URLSearchParams(search).get("passcode") || inputPasscode;
       if (mt.passcode && providedPass !== mt.passcode) {
         setNeedPasscode(true);
         return;
@@ -1243,7 +1442,7 @@ export default function MeetingRoom() {
     }
   }, [inputPasscode, navigate, roomId, search]);
 
-  async function joinMeeting(meetingId, userId) {
+  const joinMeeting = async (meetingId, userId) => {
     if (isJoining) return;
     setIsJoining(true);
     setConnectionStatus("Connecting...");
@@ -1252,19 +1451,19 @@ export default function MeetingRoom() {
       const stream = await requestMediaPermissions();
       updateParticipants(meetingId);
 
-      const peer = createPeer();
+      const peer = createPeer(userId);
       peerRef.current = peer;
 
       peer.on("open", async (pid) => {
         try {
-          setParticipantNames(prev => ({
+          setParticipantNames((prev) => ({
             ...prev,
-            [pid]: user?.email || pid
+            [pid]: user?.email || pid,
           }));
 
           let attempts = 0;
           const maxAttempts = 3;
-          
+
           while (attempts < maxAttempts) {
             try {
               const { error } = await supabase.from("signals").upsert(
@@ -1285,7 +1484,9 @@ export default function MeetingRoom() {
             } catch (err) {
               attempts++;
               if (attempts >= maxAttempts) throw err;
-              await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+              await new Promise((resolve) =>
+                setTimeout(resolve, 1000 * attempts)
+              );
             }
           }
 
@@ -1299,13 +1500,19 @@ export default function MeetingRoom() {
           if (others?.length > 0) {
             const MAX_CONCURRENT_CONNECTIONS = 3;
             const connectionGroups = [];
-            
-            for (let i = 0; i < others.length; i += MAX_CONCURRENT_CONNECTIONS) {
-              connectionGroups.push(others.slice(i, i + MAX_CONCURRENT_CONNECTIONS));
+
+            for (
+              let i = 0;
+              i < others.length;
+              i += MAX_CONCURRENT_CONNECTIONS
+            ) {
+              connectionGroups.push(
+                others.slice(i, i + MAX_CONCURRENT_CONNECTIONS)
+              );
             }
-            
+
             for (const group of connectionGroups) {
-              await Promise.all(group.map(o => connectToPeer(o.peer_id)));
+              await Promise.all(group.map((o) => connectToPeer(o.peer_id)));
             }
           }
 
@@ -1357,15 +1564,17 @@ export default function MeetingRoom() {
 
       peer.on("call", (call) => {
         try {
-          const streamToAnswerWith = isScreenSharing && screenStreamRef.current ? 
-            new MediaStream([
-              ...screenStreamRef.current.getVideoTracks(),
-              ...localStreamRef.current.getAudioTracks()
-            ]) : 
-            localStreamRef.current;
-            
+          const streamToAnswerWith =
+            isScreenSharing && screenStreamRef.current
+              ? new MediaStream([
+                  ...screenStreamRef.current.getVideoTracks(),
+                  ...localStreamRef.current.getAudioTracks(),
+                ])
+              : localStreamRef.current;
+
           call.answer(streamToAnswerWith);
           peerConnectionsRef.current[call.peer] = call;
+          activePeerConnections.current.add(call.peer);
           setupCall(call, call.peer);
         } catch (err) {
           console.error("Error answering call:", err);
@@ -1373,6 +1582,7 @@ export default function MeetingRoom() {
             if (localStreamRef.current) {
               call.answer(localStreamRef.current);
               peerConnectionsRef.current[call.peer] = call;
+              activePeerConnections.current.add(call.peer);
               setupCall(call, call.peer);
             }
           }, 1000);
@@ -1385,9 +1595,9 @@ export default function MeetingRoom() {
       setIsJoining(false);
       setTimeout(() => joinMeeting(meetingId, userId), 5000);
     }
-  }
+  };
 
-  function setupParticipantsListener(mtId) {
+  const setupParticipantsListener = (mtId) => {
     if (!participantsChannel.current) {
       participantsChannel.current = supabase
         .channel(`participants:${mtId}`)
@@ -1410,7 +1620,7 @@ export default function MeetingRoom() {
         )
         .subscribe();
     }
-  }
+  };
 
   useEffect(() => {
     const pass = new URLSearchParams(search).get("passcode") || "";
@@ -1427,10 +1637,15 @@ export default function MeetingRoom() {
     return () => {
       isMountedRef.current = false;
       leaveRoom();
-      
+
       if (audioContextRef.current) {
         audioContextRef.current.close();
         audioContextRef.current = null;
+      }
+
+      if (screenShareContainerRef.current) {
+        screenShareContainerRef.current.remove();
+        screenShareContainerRef.current = null;
       }
     };
   }, [needPasscode, initRoom]);
@@ -1504,11 +1719,13 @@ export default function MeetingRoom() {
               {isMuted ? " 🔇" : " 🔊"}
               {!cameraOn ? " 📷❌" : " 📷"}
               {isScreenSharing && " 🖥️"}
-              {activeSpeakers['local'] && " 🗣️"}
+              {activeSpeakers["local"] && " 🗣️"}
             </div>
-            <div className={`absolute top-2 right-2 w-3 h-3 rounded-full ${
-              activeSpeakers['local'] ? 'bg-green-500' : 'bg-transparent'
-            }`}></div>
+            <div
+              className={`absolute top-2 right-2 w-3 h-3 rounded-full ${
+                activeSpeakers["local"] ? "bg-green-500" : "bg-transparent"
+              }`}
+            ></div>
           </div>
 
           <div
@@ -1519,36 +1736,54 @@ export default function MeetingRoom() {
           <div className="flex flex-wrap gap-2 justify-center bg-gray-100 p-3 rounded-lg">
             <button
               onClick={toggleMute}
-              className={`p-3 rounded-full flex items-center gap-2 ${isMuted ? 'bg-red-500 text-white' : 'bg-gray-300'} hover:bg-gray-400`}
+              className={`p-3 rounded-full flex items-center gap-2 ${
+                isMuted ? "bg-red-500 text-white" : "bg-gray-300"
+              } hover:bg-gray-400`}
               title={isMuted ? "Unmute" : "Mute"}
             >
               {isMuted ? "🔇" : "🔊"}
-              <span className="text-sm hidden sm:inline">{isMuted ? "Unmute" : "Mute"}</span>
+              <span className="text-sm hidden sm:inline">
+                {isMuted ? "Unmute" : "Mute"}
+              </span>
             </button>
             <button
               onClick={toggleCamera}
-              className={`p-3 rounded-full flex items-center gap-2 ${cameraOn ? 'bg-gray-300' : 'bg-red-500 text-white'} hover:bg-gray-400`}
+              className={`p-3 rounded-full flex items-center gap-2 ${
+                cameraOn ? "bg-gray-300" : "bg-red-500 text-white"
+              } hover:bg-gray-400`}
               title={cameraOn ? "Turn off camera" : "Turn on camera"}
             >
               {cameraOn ? "📷" : "📷❌"}
-              <span className="text-sm hidden sm:inline">{cameraOn ? "Stop Video" : "Start Video"}</span>
+              <span className="text-sm hidden sm:inline">
+                {cameraOn ? "Stop Video" : "Start Video"}
+              </span>
             </button>
-            <button
-              onClick={toggleScreenShare}
-              className={`p-3 rounded-full flex items-center gap-2 ${isScreenSharing ? 'bg-blue-500 text-white' : 'bg-gray-300'} hover:bg-gray-400`}
-              title={isScreenSharing ? "Stop sharing" : "Share screen"}
-            >
-              🖥️
-              <span className="text-sm hidden sm:inline">{isScreenSharing ? "Stop Share" : "Share Screen"}</span>
-            </button>
+            {!isMobile && (
+              <button
+                onClick={toggleScreenShare}
+                className={`p-3 rounded-full flex items-center gap-2 ${
+                  isScreenSharing ? "bg-blue-500 text-white" : "bg-gray-300"
+                } hover:bg-gray-400`}
+                disabled={isMobile}
+              >
+                🖥️
+                <span className="text-sm hidden sm:inline">
+                  {isScreenSharing ? "Stop Share" : "Share Screen"}
+                </span>
+              </button>
+            )}
             {isHost && (
               <button
                 onClick={isRecording ? stopRecording : startRecording}
-                className={`p-3 rounded-full flex items-center gap-2 ${isRecording ? 'bg-red-500 text-white' : 'bg-gray-300'} hover:bg-gray-400`}
+                className={`p-3 rounded-full flex items-center gap-2 ${
+                  isRecording ? "bg-red-500 text-white" : "bg-gray-300"
+                } hover:bg-gray-400`}
                 title={isRecording ? "Stop recording" : "Start recording"}
               >
                 {isRecording ? "⏹️" : "🔴"}
-                <span className="text-sm hidden sm:inline">{isRecording ? "Stop Recording" : "Record"}</span>
+                <span className="text-sm hidden sm:inline">
+                  {isRecording ? "Stop Recording" : "Record"}
+                </span>
               </button>
             )}
             <button
@@ -1565,10 +1800,15 @@ export default function MeetingRoom() {
           </div>
 
           <div className="flex items-center gap-2">
-            <div className={`w-3 h-3 rounded-full ${
-              connectionStatus === 'Connected' ? 'bg-green-500' : 
-              connectionStatus.includes('Error') ? 'bg-red-500' : 'bg-yellow-500'
-            }`}></div>
+            <div
+              className={`w-3 h-3 rounded-full ${
+                connectionStatus === "Connected"
+                  ? "bg-green-500"
+                  : connectionStatus.includes("Error")
+                  ? "bg-red-500"
+                  : "bg-yellow-500"
+              }`}
+            ></div>
             <span className="text-sm">{connectionStatus}</span>
           </div>
         </div>
@@ -1576,10 +1816,15 @@ export default function MeetingRoom() {
         <div className="space-y-4">
           {permitToJoin && (
             <div className="bg-white border rounded-lg p-3">
-              <h3 className="font-bold mb-2">👥 Participants ({participants.length})</h3>
+              <h3 className="font-bold mb-2">
+                👥 Participants ({participants.length})
+              </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
                 {participants.map((participantId) => (
-                  <div key={participantId} className="flex items-center p-2 bg-gray-50 rounded">
+                  <div
+                    key={participantId}
+                    className="flex items-center p-2 bg-gray-50 rounded"
+                  >
                     <span className="text-sm truncate">
                       {participantNames[participantId] || participantId}
                     </span>
@@ -1597,11 +1842,18 @@ export default function MeetingRoom() {
 
           {isHost && waitingList.length > 0 && (
             <div className="bg-white border rounded-lg p-3">
-              <h3 className="font-bold mb-2">👥 Waiting Room ({waitingList.length})</h3>
+              <h3 className="font-bold mb-2">
+                👥 Waiting Room ({waitingList.length})
+              </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
                 {waitingList.map((req) => (
-                  <div key={req.id} className="flex items-center justify-between p-2 bg-gray-50 rounded">
-                    <span className="text-sm truncate">{req.profiles?.email || req.user_id}</span>
+                  <div
+                    key={req.id}
+                    className="flex items-center justify-between p-2 bg-gray-50 rounded"
+                  >
+                    <span className="text-sm truncate">
+                      {req.profiles?.email || req.user_id}
+                    </span>
                     <div className="flex gap-1">
                       <button
                         onClick={() => approveUser(req.user_id)}
@@ -1627,12 +1879,17 @@ export default function MeetingRoom() {
           {waitingForApproval && (
             <div className="bg-yellow-100 border border-yellow-300 rounded-lg p-4">
               <p className="text-yellow-800">
-                ⏳ Your request to join has been sent to the host. Please wait for approval...
+                ⏳ Your request to join has been sent to the host. Please wait
+                for approval...
               </p>
             </div>
           )}
 
-          <div className={`bg-white border rounded-lg ${showChat ? 'block' : 'hidden'}`}>
+          <div
+            className={`bg-white border rounded-lg ${
+              showChat ? "block" : "hidden"
+            }`}
+          >
             <div className="p-3 border-b flex justify-between items-center">
               <h3 className="font-bold">💬 Chat</h3>
               <button
@@ -1655,7 +1912,7 @@ export default function MeetingRoom() {
                 type="text"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
+                onKeyDown={(e) => e.key === "Enter" && sendMessage()}
                 placeholder="Type a message..."
                 className="flex-1 border p-2 rounded-l"
               />
@@ -1671,7 +1928,7 @@ export default function MeetingRoom() {
           <div className="bg-white border rounded-lg p-3">
             <h3 className="font-bold mb-2">🎉 Reactions</h3>
             <div className="flex flex-wrap gap-2 mb-3">
-              {['👍', '👎', '😄', '😕', '❤️', '🔥', '👏', '🎉'].map((emoji) => (
+              {["👍", "👎", "😄", "😕", "❤️", "🔥", "👏", "🎉"].map((emoji) => (
                 <button
                   key={emoji}
                   onClick={() => sendReaction(emoji)}
