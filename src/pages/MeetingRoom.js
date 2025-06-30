@@ -20,7 +20,7 @@ export default function MeetingRoom() {
   const navigate = useNavigate();
   const { search } = useLocation();
 
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
   const [participants, setParticipants] = useState([]);
@@ -196,27 +196,26 @@ export default function MeetingRoom() {
   };
 
   const createPendingRequest = async (meetingId, userId) => {
-  try {
-    const { data: { user: authUser } } = await supabase.auth.getUser();
-    
-    const { error } = await supabase.from("participants").upsert(
-      {
-        meeting_id: meetingId,
-        user_id: userId,
-        email: authUser.email,  // Store the email when creating the request
-        status: "pending",
-        created_at: new Date().toISOString(),
-      },
-      { onConflict: "meeting_id,user_id" }
-    );
+    try {
+      await ensureProfileExists(userId);
 
-    if (error) throw error;
-    setWaitingForApproval(true);
-    await updateWaitingList(meetingId); // Refresh waiting list
-  } catch (error) {
-    console.error("Error in createPendingRequest:", error);
-  }
-};
+      const { error } = await supabase.from("participants").upsert(
+        {
+          meeting_id: meetingId,
+          user_id: userId,
+          status: "pending",
+          created_at: new Date().toISOString(),
+        },
+        { onConflict: "meeting_id,user_id" }
+      );
+
+      if (error) throw error;
+      setWaitingForApproval(true);
+    } catch (error) {
+      console.error("Error in createPendingRequest:", error);
+      alert("Failed to create join request. Please try again.");
+    }
+  };
 
   const setupWaitingListener = useCallback((mtId) => {
     updateWaitingList(mtId);
@@ -296,33 +295,34 @@ export default function MeetingRoom() {
   );
 
   const updateParticipants = async (meetingId) => {
-  try {
-    const { data, error } = await supabase
-      .from("participants")
-      .select(`
-        id,
+    try {
+      const { data, error } = await supabase
+        .from("participants")
+        .select(
+          `
         user_id,
-        email,  // This will use the email stored in participants table
+        email,
         status,
         created_at
-      `)
-      .eq("meeting_id", meetingId)
-      .eq("status", "approved");
+      `
+        )
+        .eq("meeting_id", meetingId)
+        .eq("status", "approved");
 
-    if (error) throw error;
+      if (error) throw error;
 
-    // Use the exact email from participants table
-    const formattedParticipants = data.map(p => ({
-      id: p.user_id,
-      user_id: p.user_id,
-      email: p.email  // No fallback needed since we stored it during approval
-    }));
+      const formattedParticipants = data.map((p) => ({
+        id: p.user_id,
+        user_id: p.user_id,
+        email: p.email , 
+      }));
 
-    setParticipants(formattedParticipants);
-  } catch (error) {
-    console.error("Error updating participants:", error);
-  }
-};
+      setParticipants(formattedParticipants);
+    } catch (error) {
+      console.error("Error updating participants:", error);
+    }
+  };
+
   const updateWaitingList = async (meetingId) => {
     try {
       // Now we can query just the participants table since it contains emails
@@ -342,6 +342,7 @@ export default function MeetingRoom() {
       setWaitingList([]);
     }
   };
+
   const requestMediaPermissions = async () => {
     if (localStreamRef.current) return localStreamRef.current;
 
@@ -1135,36 +1136,33 @@ export default function MeetingRoom() {
     }
   };
 
- const approveUser = async (userId) => {
-  try {
-    // Get the waiting user's data including their email
-    const waitingUser = waitingList.find(user => user.user_id === userId);
-    
-    if (!waitingUser) {
-      throw new Error("User not found in waiting list");
+  const approveUser = async (uid) => {
+    try {
+      // First get the user's email from profiles
+      const { data: userProfile } = await supabase
+        .from("profiles")
+        .select("email")
+        .eq("id", uid)
+        .single();
+
+      const { error: updateError } = await supabase
+        .from("participants")
+        .update({
+          status: "approved",
+          email: userProfile?.email, // Store the email in participants table
+          updated_at: new Date().toISOString(),
+        })
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", uid);
+
+      if (updateError) throw updateError;
+
+      // Rest of the approval logic...
+    } catch (error) {
+      console.error("Error approving user:", error);
+      alert("Failed to approve user. Please try again.");
     }
-
-    // Update the participant status to approved while preserving the email
-    const { error: updateError } = await supabase
-      .from("participants")
-      .update({
-        status: "approved",
-        email: waitingUser.email, // Preserve the exact email from waiting list
-        updated_at: new Date().toISOString()
-      })
-      .eq("meeting_id", meetingDbId)
-      .eq("user_id", userId);
-
-    if (updateError) throw updateError;
-    
-    // Refresh both lists
-    await updateParticipants(meetingDbId);
-    await updateWaitingList(meetingDbId);
-    
-  } catch (error) {
-    console.error("Error approving user:", error);
-  }
-};
+  };
 
   const denyUser = async (uid) => {
     try {
@@ -1782,28 +1780,33 @@ export default function MeetingRoom() {
         </div>
 
         <div className="space-y-4">
-        {permitToJoin && (
-  <div className="bg-white border rounded-lg p-3">
-    <h3 className="font-bold mb-2">
-      👥 Participants ({participants.length})
-    </h3>
-    <div className="space-y-2 max-h-60 overflow-y-auto">
-      {participants.map((participant) => (
-        <div
-          key={participant.id}
-          className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
-        >
-          <span className="text-sm truncate flex items-center">
-            {participant.email}  {/* This will now show the exact waiting list email */}
-            {participant.user_id === user?.id && (
-              <span className="ml-2 text-xs text-gray-500">(You)</span>
-            )}
-          </span>
-        </div>
-      ))}
-    </div>
-  </div>
-)}
+          {permitToJoin && (
+            <div className="bg-white border rounded-lg p-3">
+              <h3 className="font-bold mb-2">
+                👥 Participants ({participants.length})
+              </h3>
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {participants.map((participant) => (
+                  <div
+                    key={participant.id}
+                    className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
+                  >
+                    <span className="text-sm truncate flex items-center">
+                      {participant.email}
+                      {participant.id === user?.id && (
+                        <span className="ml-2 text-xs text-gray-500">
+                          (You)
+                        </span>
+                      )}
+                    </span>
+                    {activeSpeakers[participant.id] && (
+                      <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {isHost && (
             <div className="bg-white border rounded-lg p-3">
               <div className="flex justify-between items-center mb-2">
