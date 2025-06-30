@@ -155,6 +155,32 @@ export default function MeetingRoom() {
     checkIfMobile();
   }, []);
 
+  useEffect(() => {
+    if (!meetingDbId || !isHost) return;
+
+    // Set up real-time listener for participant changes
+    const participantListener = supabase
+      .channel(`participant_changes:${meetingDbId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${meetingDbId}`,
+        },
+        (payload) => {
+          console.log("Participant change detected:", payload);
+          updateWaitingList(meetingDbId);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(participantListener);
+    };
+  }, [meetingDbId, isHost]);
+
   const ensureProfileExists = async (userId) => {
     const {
       data: { user },
@@ -312,50 +338,20 @@ export default function MeetingRoom() {
 
   const updateWaitingList = async (meetingId) => {
     try {
-      // First get all pending participants
-      const { data: participants, error: participantsError } = await supabase
+      // Now we can query just the participants table since it contains emails
+      const { data, error } = await supabase
         .from("participants")
-        .select("id, user_id, status, created_at")
+        .select("id, user_id, email, status, created_at")
         .eq("meeting_id", meetingId)
         .eq("status", "pending")
         .order("created_at", { ascending: true });
 
-      if (participantsError) throw participantsError;
-      if (!participants?.length) {
-        console.log("No pending participants found");
-        return;
-      }
+      if (error) throw error;
 
-      // Debug: Check if profiles exist for these users
-      const profileCheck = await debugCheckProfiles(
-        participants.map((p) => p.user_id)
-      );
-      console.log("Profile check:", profileCheck);
-
-      // Then get their profile emails
-      const { data: profiles, error: profilesError } = await supabase
-        .from("profiles")
-        .select("id, email")
-        .in(
-          "id",
-          participants.map((p) => p.user_id)
-        );
-
-      if (profilesError) throw profilesError;
-
-      // Combine the data
-      const waitingListWithEmails = participants.map((participant) => {
-        const profile = profiles.find((p) => p.id === participant.user_id);
-        return {
-          ...participant,
-          email: profile?.email || "No email found",
-        };
-      });
-
-      console.log("Final waiting list data:", waitingListWithEmails);
-      setWaitingList(waitingListWithEmails);
+      console.log("Waiting list data:", data);
+      setWaitingList(data || []);
     } catch (error) {
-      console.error("Error updating waiting list:", error);
+      console.error("Error fetching waiting list:", error);
       setWaitingList([]);
     }
   };
@@ -1848,9 +1844,17 @@ export default function MeetingRoom() {
           )}
           {isHost && (
             <div className="bg-white border rounded-lg p-3">
-              <h3 className="font-bold mb-2">
-                👥 Waiting Room ({waitingList.length})
-              </h3>
+              <div className="flex justify-between items-center mb-2">
+                <h3 className="font-bold">
+                  👥 Waiting Room ({waitingList.length})
+                </h3>
+                <button
+                  onClick={() => updateWaitingList(meetingDbId)}
+                  className="text-sm bg-blue-100 px-2 py-1 rounded hover:bg-blue-200"
+                >
+                  Refresh
+                </button>
+              </div>
 
               {waitingList.length === 0 ? (
                 <p className="text-sm text-gray-500">
@@ -1861,19 +1865,14 @@ export default function MeetingRoom() {
                   {waitingList.map((participant) => (
                     <div
                       key={participant.id}
-                      className="flex items-center justify-between p-2 bg-gray-50 rounded"
+                      className="flex items-center justify-between p-2 bg-gray-50 rounded hover:bg-gray-100"
                     >
-                      <div className="flex items-center">
-                        <span className="text-sm font-medium truncate max-w-[180px]">
-                          {participant.email}
+                      <div className="flex items-center min-w-0">
+                        <span className="text-sm font-medium truncate">
+                          {participant.email || `User (${participant.user_id})`}
                         </span>
-                        {participant.email === "No email found" && (
-                          <span className="ml-2 text-xs text-gray-500">
-                            (ID: {participant.user_id})
-                          </span>
-                        )}
                       </div>
-                      <div className="flex gap-2">
+                      <div className="flex gap-2 shrink-0">
                         <button
                           onClick={() => approveUser(participant.user_id)}
                           className="px-2 py-1 bg-green-500 text-white rounded hover:bg-green-600 text-sm"
