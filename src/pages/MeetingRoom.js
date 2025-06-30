@@ -299,47 +299,66 @@ export default function MeetingRoom() {
       console.error("Error updating participants:", error);
     }
   };
+  // Add this inside your MeetingRoom component, before the updateWaitingList function
+  const debugCheckProfiles = async (userIds) => {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email")
+      .in("id", userIds);
+
+    console.log("Profile check results:", data);
+    return data;
+  };
 
   const updateWaitingList = async (meetingId) => {
     try {
-      // Perform a direct join between participants and profiles
-      const { data, error } = await supabase
+      // First get all pending participants
+      const { data: participants, error: participantsError } = await supabase
         .from("participants")
-        .select(
-          `
-        id,
-        user_id,
-        status,
-        created_at,
-        profiles!inner(
-          email
-        )
-      `
-        )
+        .select("id, user_id, status, created_at")
         .eq("meeting_id", meetingId)
         .eq("status", "pending")
         .order("created_at", { ascending: true });
 
-      if (error) {
-        console.error("Error fetching waiting list:", error);
+      if (participantsError) throw participantsError;
+      if (!participants?.length) {
+        console.log("No pending participants found");
         return;
       }
 
-      // Transform the data to make email easily accessible
-      const formattedData = data.map((item) => ({
-        id: item.id,
-        user_id: item.user_id,
-        email: item.profiles.email, // Direct access to email
-        status: item.status,
-        created_at: item.created_at,
-      }));
+      // Debug: Check if profiles exist for these users
+      const profileCheck = await debugCheckProfiles(
+        participants.map((p) => p.user_id)
+      );
+      console.log("Profile check:", profileCheck);
 
-      setWaitingList(formattedData);
+      // Then get their profile emails
+      const { data: profiles, error: profilesError } = await supabase
+        .from("profiles")
+        .select("id, email")
+        .in(
+          "id",
+          participants.map((p) => p.user_id)
+        );
+
+      if (profilesError) throw profilesError;
+
+      // Combine the data
+      const waitingListWithEmails = participants.map((participant) => {
+        const profile = profiles.find((p) => p.id === participant.user_id);
+        return {
+          ...participant,
+          email: profile?.email || "No email found",
+        };
+      });
+
+      console.log("Final waiting list data:", waitingListWithEmails);
+      setWaitingList(waitingListWithEmails);
     } catch (error) {
-      console.error("Error in updateWaitingList:", error);
+      console.error("Error updating waiting list:", error);
+      setWaitingList([]);
     }
   };
-
   const requestMediaPermissions = async () => {
     if (localStreamRef.current) return localStreamRef.current;
 
@@ -1827,41 +1846,53 @@ export default function MeetingRoom() {
               </div>
             </div>
           )}
-
-          {isHost && waitingList.length > 0 && (
+          {isHost && (
             <div className="bg-white border rounded-lg p-3">
               <h3 className="font-bold mb-2">
                 👥 Waiting Room ({waitingList.length})
               </h3>
-              <div className="space-y-2 max-h-60 overflow-y-auto">
-                {waitingList.map((participant) => (
-                  <div
-                    key={participant.id}
-                    className="flex items-center justify-between p-2 bg-gray-50 rounded"
-                  >
-                    <span className="text-sm truncate">
-                      {participant.email} {/* Now showing the email */}
-                    </span>
-                    <div className="flex gap-1">
-                      <button
-                        onClick={() => approveUser(participant.user_id)}
-                        className="p-1 bg-green-500 text-white rounded hover:bg-green-600"
-                      >
-                        ✓ Admit
-                      </button>
-                      <button
-                        onClick={() => denyUser(participant.user_id)}
-                        className="p-1 bg-red-500 text-white rounded hover:bg-red-600"
-                      >
-                        ✗ Deny
-                      </button>
+
+              {waitingList.length === 0 ? (
+                <p className="text-sm text-gray-500">
+                  No users currently waiting
+                </p>
+              ) : (
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {waitingList.map((participant) => (
+                    <div
+                      key={participant.id}
+                      className="flex items-center justify-between p-2 bg-gray-50 rounded"
+                    >
+                      <div className="flex items-center">
+                        <span className="text-sm font-medium truncate max-w-[180px]">
+                          {participant.email}
+                        </span>
+                        {participant.email === "No email found" && (
+                          <span className="ml-2 text-xs text-gray-500">
+                            (ID: {participant.user_id})
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => approveUser(participant.user_id)}
+                          className="px-2 py-1 bg-green-500 text-white rounded hover:bg-green-600 text-sm"
+                        >
+                          Admit
+                        </button>
+                        <button
+                          onClick={() => denyUser(participant.user_id)}
+                          className="px-2 py-1 bg-red-500 text-white rounded hover:bg-red-600 text-sm"
+                        >
+                          Deny
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
-
           {waitingForApproval && (
             <div className="bg-yellow-100 border border-yellow-300 rounded-lg p-4">
               <p className="text-yellow-800">
