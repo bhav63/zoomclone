@@ -297,30 +297,20 @@ export default function MeetingRoom() {
   const updateParticipants = async (meetingId) => {
   try {
     const { data, error } = await supabase
-      .from('participants')
-      .select(`
-        user_id,
-        profiles:user_id (
-          email
-        )
-      `)
-      .eq('meeting_id', meetingId)
-      .eq('status', 'approved');
+      .from("participants")
+      .select("id, user_id, email, status, created_at")
+      .eq("meeting_id", meetingId)
+      .eq("status", "approved")
+      .order("created_at", { ascending: true });
 
     if (error) throw error;
 
-    // Transform the data to include emails
-    const formattedParticipants = data.map(p => ({
-      id: p.user_id,
-      email: p.profiles?.email || p.user_id // Fallback to user_id if no email
-    }));
-
-    setParticipants(formattedParticipants);
+    console.log("Participants data:", data);
+    setParticipants(data || []);
   } catch (error) {
-    console.error('Error updating participants:', error);
+    console.error("Error updating participants:", error);
   }
 };
-
   const updateWaitingList = async (meetingId) => {
     try {
       // Now we can query just the participants table since it contains emails
@@ -1802,7 +1792,7 @@ export default function MeetingRoom() {
         </div>
 
         <div className="space-y-4">
-         {permitToJoin && (
+        {permitToJoin && (
   <div className="bg-white border rounded-lg p-3">
     <h3 className="font-bold mb-2">
       👥 Participants ({participants.length})
