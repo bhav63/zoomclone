@@ -196,26 +196,27 @@ export default function MeetingRoom() {
   };
 
   const createPendingRequest = async (meetingId, userId) => {
-    try {
-      await ensureProfileExists(userId);
+  try {
+    const { data: { user: authUser } } = await supabase.auth.getUser();
+    
+    const { error } = await supabase.from("participants").upsert(
+      {
+        meeting_id: meetingId,
+        user_id: userId,
+        email: authUser.email,  // Store the email when creating the request
+        status: "pending",
+        created_at: new Date().toISOString(),
+      },
+      { onConflict: "meeting_id,user_id" }
+    );
 
-      const { error } = await supabase.from("participants").upsert(
-        {
-          meeting_id: meetingId,
-          user_id: userId,
-          status: "pending",
-          created_at: new Date().toISOString(),
-        },
-        { onConflict: "meeting_id,user_id" }
-      );
-
-      if (error) throw error;
-      setWaitingForApproval(true);
-    } catch (error) {
-      console.error("Error in createPendingRequest:", error);
-      alert("Failed to create join request. Please try again.");
-    }
-  };
+    if (error) throw error;
+    setWaitingForApproval(true);
+    await updateWaitingList(meetingId); // Refresh waiting list
+  } catch (error) {
+    console.error("Error in createPendingRequest:", error);
+  }
+};
 
   const setupWaitingListener = useCallback((mtId) => {
     updateWaitingList(mtId);
@@ -298,15 +299,26 @@ export default function MeetingRoom() {
   try {
     const { data, error } = await supabase
       .from("participants")
-      .select("id, user_id, email, status, created_at")
+      .select(`
+        id,
+        user_id,
+        email,  // This will use the email stored in participants table
+        status,
+        created_at
+      `)
       .eq("meeting_id", meetingId)
-      .eq("status", "approved")
-      .order("created_at", { ascending: true });
+      .eq("status", "approved");
 
     if (error) throw error;
 
-    console.log("Participants data:", data);
-    setParticipants(data || []);
+    // Use the exact email from participants table
+    const formattedParticipants = data.map(p => ({
+      id: p.user_id,
+      user_id: p.user_id,
+      email: p.email  // No fallback needed since we stored it during approval
+    }));
+
+    setParticipants(formattedParticipants);
   } catch (error) {
     console.error("Error updating participants:", error);
   }
@@ -1123,58 +1135,36 @@ export default function MeetingRoom() {
     }
   };
 
-  const approveUser = async (uid) => {
-    try {
-      const { error: updateError } = await supabase
-        .from("participants")
-        .update({
-          status: "approved",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", uid);
-
-      if (updateError) throw updateError;
-
-      const { data: signal } = await supabase
-        .from("signals")
-        .select("peer_id")
-        .eq("room_id", roomId)
-        .eq("user_id", uid)
-        .single();
-
-      if (signal?.peer_id) {
-        await connectToPeer(signal.peer_id);
-
-        const { data: otherParticipants } = await supabase
-          .from("signals")
-          .select("peer_id")
-          .eq("room_id", roomId)
-          .neq("peer_id", signal.peer_id);
-
-        if (otherParticipants?.length > 0) {
-          await Promise.all(
-            otherParticipants.map(async (p) => {
-              try {
-                await supabase
-                  .from("signals")
-                  .update({ last_active: new Date().toISOString() })
-                  .eq("room_id", roomId)
-                  .eq("peer_id", p.peer_id);
-              } catch (err) {
-                console.error("Error notifying participant:", err);
-              }
-            })
-          );
-        }
-      }
-
-      await updateParticipants(meetingDbId);
-    } catch (error) {
-      console.error("Error approving user:", error);
-      alert("Failed to approve user. Please try again.");
+ const approveUser = async (userId) => {
+  try {
+    // Get the waiting user's data including their email
+    const waitingUser = waitingList.find(user => user.user_id === userId);
+    
+    if (!waitingUser) {
+      throw new Error("User not found in waiting list");
     }
-  };
+
+    // Update the participant status to approved while preserving the email
+    const { error: updateError } = await supabase
+      .from("participants")
+      .update({
+        status: "approved",
+        email: waitingUser.email, // Preserve the exact email from waiting list
+        updated_at: new Date().toISOString()
+      })
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", userId);
+
+    if (updateError) throw updateError;
+    
+    // Refresh both lists
+    await updateParticipants(meetingDbId);
+    await updateWaitingList(meetingDbId);
+    
+  } catch (error) {
+    console.error("Error approving user:", error);
+  }
+};
 
   const denyUser = async (uid) => {
     try {
@@ -1804,14 +1794,11 @@ export default function MeetingRoom() {
           className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
         >
           <span className="text-sm truncate flex items-center">
-            {participant.email}
-            {participant.id === user?.id && (
+            {participant.email}  {/* This will now show the exact waiting list email */}
+            {participant.user_id === user?.id && (
               <span className="ml-2 text-xs text-gray-500">(You)</span>
             )}
           </span>
-          {activeSpeakers[participant.id] && (
-            <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
-          )}
         </div>
       ))}
     </div>
