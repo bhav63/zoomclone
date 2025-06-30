@@ -294,46 +294,32 @@ export default function MeetingRoom() {
     [navigate, roomId]
   );
 
-  const updateParticipants = async (mtId) => {
+  const updateParticipants = async (meetingId) => {
     try {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("participants")
-        .select("user_id, profiles:user_id(email)")
-        .eq("meeting_id", mtId)
+        .select(
+          `
+        user_id,
+        profiles:user_id (
+          email
+        )
+      `
+        )
+        .eq("meeting_id", meetingId)
         .eq("status", "approved");
 
-      if (data) {
-        setParticipants(data.map((p) => p.user_id));
+      if (error) throw error;
 
-        const names = {};
-        data.forEach((p) => {
-          names[p.user_id] = p.profiles?.email || p.user_id;
-        });
-        setParticipantNames(names);
+      const formattedParticipants = data.map((p) => ({
+        id: p.user_id,
+        email: p.profiles?.email || p.user_id, // Fallback to user_id if no email
+      }));
 
-        Object.keys(remoteVideosRef.current).forEach((peerId) => {
-          const label =
-            remoteVideosRef.current[peerId]?.querySelector(
-              ".participant-label"
-            );
-          if (label) {
-            label.textContent = names[peerId] || peerId;
-          }
-        });
-      }
+      setParticipants(formattedParticipants);
     } catch (error) {
       console.error("Error updating participants:", error);
     }
-  };
-  // Add this inside your MeetingRoom component, before the updateWaitingList function
-  const debugCheckProfiles = async (userIds) => {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, email")
-      .in("id", userIds);
-
-    console.log("Profile check results:", data);
-    return data;
   };
 
   const updateWaitingList = async (meetingId) => {
@@ -1823,18 +1809,20 @@ export default function MeetingRoom() {
                 👥 Participants ({participants.length})
               </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
-                {participants.map((participantId) => (
+                {participants.map((participant) => (
                   <div
-                    key={participantId}
-                    className="flex items-center p-2 bg-gray-50 rounded"
+                    key={participant.id}
+                    className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
                   >
-                    <span className="text-sm truncate">
-                      {participantNames[participantId] || participantId}
+                    <span className="text-sm truncate flex items-center">
+                      {participant.email}
+                      {participant.id === user?.id && (
+                        <span className="ml-2 text-xs text-gray-500">
+                          (You)
+                        </span>
+                      )}
                     </span>
-                    {participantId === user?.id && (
-                      <span className="ml-2 text-xs text-gray-500">(You)</span>
-                    )}
-                    {activeSpeakers[participantId] && (
+                    {activeSpeakers[participant.id] && (
                       <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
                     )}
                   </div>
