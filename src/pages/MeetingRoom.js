@@ -295,32 +295,31 @@ export default function MeetingRoom() {
   );
 
   const updateParticipants = async (meetingId) => {
-    try {
-      const { data, error } = await supabase
-        .from("participants")
-        .select(
-          `
+  try {
+    const { data, error } = await supabase
+      .from('participants')
+      .select(`
         user_id,
         profiles:user_id (
           email
         )
-      `
-        )
-        .eq("meeting_id", meetingId)
-        .eq("status", "approved");
+      `)
+      .eq('meeting_id', meetingId)
+      .eq('status', 'approved');
 
-      if (error) throw error;
+    if (error) throw error;
 
-      const formattedParticipants = data.map((p) => ({
-        id: p.user_id,
-        email: p.profiles?.email || p.user_id, // Fallback to user_id if no email
-      }));
+    // Transform the data to include emails
+    const formattedParticipants = data.map(p => ({
+      id: p.user_id,
+      email: p.profiles?.email || p.user_id // Fallback to user_id if no email
+    }));
 
-      setParticipants(formattedParticipants);
-    } catch (error) {
-      console.error("Error updating participants:", error);
-    }
-  };
+    setParticipants(formattedParticipants);
+  } catch (error) {
+    console.error('Error updating participants:', error);
+  }
+};
 
   const updateWaitingList = async (meetingId) => {
     try {
@@ -1803,33 +1802,31 @@ export default function MeetingRoom() {
         </div>
 
         <div className="space-y-4">
-          {permitToJoin && (
-            <div className="bg-white border rounded-lg p-3">
-              <h3 className="font-bold mb-2">
-                👥 Participants ({participants.length})
-              </h3>
-              <div className="space-y-2 max-h-60 overflow-y-auto">
-                {participants.map((participant) => (
-                  <div
-                    key={participant.id}
-                    className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
-                  >
-                    <span className="text-sm truncate flex items-center">
-                      {participant.email}
-                      {participant.id === user?.id && (
-                        <span className="ml-2 text-xs text-gray-500">
-                          (You)
-                        </span>
-                      )}
-                    </span>
-                    {activeSpeakers[participant.id] && (
-                      <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
+         {permitToJoin && (
+  <div className="bg-white border rounded-lg p-3">
+    <h3 className="font-bold mb-2">
+      👥 Participants ({participants.length})
+    </h3>
+    <div className="space-y-2 max-h-60 overflow-y-auto">
+      {participants.map((participant) => (
+        <div
+          key={participant.id}
+          className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
+        >
+          <span className="text-sm truncate flex items-center">
+            {participant.email}
+            {participant.id === user?.id && (
+              <span className="ml-2 text-xs text-gray-500">(You)</span>
+            )}
+          </span>
+          {activeSpeakers[participant.id] && (
+            <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
           )}
+        </div>
+      ))}
+    </div>
+  </div>
+)}
           {isHost && (
             <div className="bg-white border rounded-lg p-3">
               <div className="flex justify-between items-center mb-2">
