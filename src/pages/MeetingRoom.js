@@ -300,42 +300,43 @@ export default function MeetingRoom() {
     }
   };
 
-  const updateWaitingList = async (mtId) => {
+  const updateWaitingList = async (meetingId) => {
     try {
-      // Step 1: First get all pending participants
-      const { data: participants, error: participantsError } = await supabase
+      // Perform a direct join between participants and profiles
+      const { data, error } = await supabase
         .from("participants")
-        .select("id, user_id, status, created_at")
-        .eq("meeting_id", mtId)
+        .select(
+          `
+        id,
+        user_id,
+        status,
+        created_at,
+        profiles!inner(
+          email
+        )
+      `
+        )
+        .eq("meeting_id", meetingId)
         .eq("status", "pending")
         .order("created_at", { ascending: true });
 
-      if (participantsError) throw participantsError;
-      if (!participants?.length) return;
+      if (error) {
+        console.error("Error fetching waiting list:", error);
+        return;
+      }
 
-      // Step 2: Get ALL profile emails at once (more efficient)
-      const { data: profiles, error: profilesError } = await supabase
-        .from("profiles")
-        .select("id, email")
-        .in(
-          "id",
-          participants.map((p) => p.user_id)
-        );
+      // Transform the data to make email easily accessible
+      const formattedData = data.map((item) => ({
+        id: item.id,
+        user_id: item.user_id,
+        email: item.profiles.email, // Direct access to email
+        status: item.status,
+        created_at: item.created_at,
+      }));
 
-      if (profilesError) throw profilesError;
-
-      // Step 3: Combine the data
-      const waitingListWithEmails = participants.map((participant) => {
-        const profile = profiles.find((p) => p.id === participant.user_id);
-        return {
-          ...participant,
-          email: profile?.email || participant.user_id, // Fallback to user_id if no email
-        };
-      });
-
-      setWaitingList(waitingListWithEmails);
+      setWaitingList(formattedData);
     } catch (error) {
-      console.error("Error updating waiting list:", error);
+      console.error("Error in updateWaitingList:", error);
     }
   };
 
@@ -1833,23 +1834,23 @@ export default function MeetingRoom() {
                 👥 Waiting Room ({waitingList.length})
               </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
-                {waitingList.map((req) => (
+                {waitingList.map((participant) => (
                   <div
-                    key={req.id}
+                    key={participant.id}
                     className="flex items-center justify-between p-2 bg-gray-50 rounded"
                   >
                     <span className="text-sm truncate">
-                      {req.email} {/* Now directly using the email field */}
+                      {participant.email} {/* Now showing the email */}
                     </span>
                     <div className="flex gap-1">
                       <button
-                        onClick={() => approveUser(req.user_id)}
+                        onClick={() => approveUser(participant.user_id)}
                         className="p-1 bg-green-500 text-white rounded hover:bg-green-600"
                       >
                         ✓ Admit
                       </button>
                       <button
-                        onClick={() => denyUser(req.user_id)}
+                        onClick={() => denyUser(participant.user_id)}
                         className="p-1 bg-red-500 text-white rounded hover:bg-red-600"
                       >
                         ✗ Deny
