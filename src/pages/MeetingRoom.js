@@ -65,7 +65,7 @@ export default function MeetingRoom() {
   const analysersRef = useRef({});
   const peerConnectionsRef = useRef({});
   const statsIntervalRef = useRef();
-
+ const approvalChannel = useRef();
   const recordingTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
   const pendingPeerConnections = useRef(new Set());
@@ -85,53 +85,36 @@ export default function MeetingRoom() {
     passcodeRequired ? `?passcode=${encodeURIComponent(inputPasscode)}` : ""
   }`;
 
- const refreshMeetingState = useCallback(async () => {
+  const refreshMeetingState = useCallback(async () => {
     if (!isMountedRef.current || !meetingDbId || !user?.id) return;
 
     try {
-      // Update participants list
       if (permitToJoin) {
         await updateParticipants(meetingDbId);
       }
 
-      // Update waiting list if host
       if (isHost) {
         await updateWaitingList(meetingDbId);
       }
 
-      // Connect to any new peers
       if (peerRef.current?.id) {
-        const { data: others, error } = await supabase
+        const { data: others } = await supabase
           .from("signals")
           .select("peer_id, user_id")
           .eq("room_id", roomId)
           .neq("peer_id", peerRef.current.id);
 
-        if (error) {
-          console.error("Error fetching other peers:", error);
-          return;
-        }
-
         if (others?.length > 0) {
-          // Connect in batches to avoid overwhelming the system
-          const BATCH_SIZE = 3;
-          for (let i = 0; i < others.length; i += BATCH_SIZE) {
-            const batch = others.slice(i, i + BATCH_SIZE);
-            await Promise.all(
-              batch.map(({ peer_id }) => {
-                if (
-                  !peerConnectionsRef.current[peer_id] &&
-                  !pendingPeerConnections.current.has(peer_id)
-                ) {
-                  return connectToPeer(peer_id);
-                }
-                return Promise.resolve();
-              })
-            );
-          }
+          others.forEach(({ peer_id }) => {
+            if (
+              !peerConnectionsRef.current[peer_id] &&
+              !pendingPeerConnections.current.has(peer_id)
+            ) {
+              connectToPeer(peer_id);
+            }
+          });
         }
       }
-
 
       if (peerRef.current) {
         if (peerRef.current.disconnected) {
@@ -761,84 +744,43 @@ export default function MeetingRoom() {
     }
   };
 
- const connectToPeer = async (peerId) => {
+  const connectToPeer = async (peerId) => {
     if (!peerRef.current || !localStreamRef.current) return;
+
     if (pendingPeerConnections.current.has(peerId)) return;
 
     pendingPeerConnections.current.add(peerId);
 
     try {
-      // Skip if already connected
-      if (peerConnectionsRef.current[peerId]?.open) {
-        pendingPeerConnections.current.delete(peerId);
-        return;
+      if (peerConnectionsRef.current[peerId]) {
+        const existingConnection = peerConnectionsRef.current[peerId];
+        if (existingConnection.open) {
+          pendingPeerConnections.current.delete(peerId);
+          return;
+        }
       }
 
-      // Limit retry attempts
       if (!retryCountsRef.current[peerId]) {
         retryCountsRef.current[peerId] = 0;
       }
+
       if (retryCountsRef.current[peerId] >= 5) {
         pendingPeerConnections.current.delete(peerId);
         return;
       }
 
+      const streamToSend =
+        isScreenSharing && screenStreamRef.current
+          ? new MediaStream([
+              ...screenStreamRef.current.getVideoTracks(),
+              ...localStreamRef.current.getAudioTracks(),
+            ])
+          : localStreamRef.current;
 
-      const streamToSend = isScreenSharing && screenStreamRef.current
-        ? new MediaStream([
-            ...screenStreamRef.current.getVideoTracks(),
-            ...localStreamRef.current.getAudioTracks()
-          ])
-        : localStreamRef.current;
-
-      // Make the call
       const call = peerRef.current.call(peerId, streamToSend);
       peerConnectionsRef.current[peerId] = call;
       activePeerConnections.current.add(peerId);
-      
-      // Setup call handlers
-      call.on("stream", (remoteStream) => {
-        if (!audioContextRef.current) {
-          const AudioContext = window.AudioContext || window.webkitAudioContext;
-          audioContextRef.current = new AudioContext();
-        }
-
-        const analyser = audioContextRef.current.createAnalyser();
-        analyser.fftSize = 512;
-        const source = audioContextRef.current.createMediaStreamSource(remoteStream);
-        source.connect(analyser);
-        analysersRef.current[peerId] = analyser;
-
-        addRemote(peerId, remoteStream);
-        setConnectionStatus("Connected");
-
-        if (!statsIntervalRef.current) {
-          startConnectionStats();
-        }
-      });
-
-      call.on("close", () => {
-        removeRemote(peerId);
-        delete peerConnectionsRef.current[peerId];
-        activePeerConnections.current.delete(peerId);
-        setConnectionStatus("Disconnected");
-        delete analysersRef.current[peerId];
-      });
-
-      call.on("error", (err) => {
-        console.error("Call error with", peerId, ":", err);
-        removeRemote(peerId);
-        delete peerConnectionsRef.current[peerId];
-        activePeerConnections.current.delete(peerId);
-        setConnectionStatus("Error: " + err.message);
-        delete analysersRef.current[peerId];
-      });
-
-      call.on("iceStateChanged", (state) => {
-        if (state === "disconnected" || state === "failed") {
-          setTimeout(() => connectToPeer(peerId), 2000);
-        }
-      });
+      setupCall(call, peerId);
 
       retryCountsRef.current[peerId] = 0;
     } catch (err) {
@@ -847,13 +789,15 @@ export default function MeetingRoom() {
       delete peerConnectionsRef.current[peerId];
       activePeerConnections.current.delete(peerId);
 
-      const delay = Math.min(1000 * Math.pow(2, retryCountsRef.current[peerId]), 8000);
+      const delay = Math.min(
+        1000 * Math.pow(2, retryCountsRef.current[peerId]),
+        8000
+      );
       setTimeout(() => connectToPeer(peerId), delay);
     } finally {
       pendingPeerConnections.current.delete(peerId);
     }
   };
-
 
   const setupCall = (call, peerId) => {
     call.on("stream", (remoteStream) => {
@@ -1194,77 +1138,34 @@ export default function MeetingRoom() {
 
  const approveUser = async (userId) => {
   try {
-    // 1. First get the user's profile to ensure we have their email
-    const { data: userProfile, error: profileError } = await supabase
-      .from('profiles')
-      .select('email')
-      .eq('id', userId)
-      .single();
-
-    if (profileError || !userProfile) {
-      throw profileError || new Error('User profile not found');
-    }
-
-    // 2. Update the participant status to approved
+    // 1. Update participant status
     const { error: updateError } = await supabase
-      .from('participants')
+      .from("participants")
       .update({
-        status: 'approved',
-        email: userProfile.email,
+        status: "approved",
         updated_at: new Date().toISOString(),
       })
-      .eq('meeting_id', meetingDbId)
-      .eq('user_id', userId);
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", userId);
 
-    if (updateError) {
-      throw updateError;
-    }
+    if (updateError) throw updateError;
 
-    // 3. Send a system message about the approval
-    const { error: messageError } = await supabase
-      .from('messages')
+    // 2. Send a real-time signal to trigger the approved user's join flow
+    const { error: signalError } = await supabase
+      .from("approval_signals")
       .insert({
-        room_id: roomId,
-        sender: 'System',
-        text: `${userProfile.email} has been admitted to the meeting`,
-        created_at: new Date().toISOString(),
+        meeting_id: meetingDbId,
+        user_id: userId,
+        approved_at: new Date().toISOString(),
       });
 
-    if (messageError) {
-      console.error('Failed to send system message:', messageError);
-      // Don't throw here - the approval still succeeded
-    }
+    if (signalError) throw signalError;
 
-    // 4. Refresh the waiting list
+    // 3. Update waiting list
     await updateWaitingList(meetingDbId);
-
-    // 5. Optional: Send a signal to the approved user to connect immediately
-    try {
-      await supabase
-        .from('signals')
-        .upsert({
-          room_id: roomId,
-          user_id: userId,
-          last_active: new Date().toISOString(),
-        });
-    } catch (signalError) {
-      console.error('Failed to update signal:', signalError);
-    }
-
-    return true;
   } catch (error) {
-    console.error('Error in approveUser:', error);
-    
-    // Show more specific error messages
-    let errorMessage = 'Failed to approve user';
-    if (error.message.includes('violates foreign key constraint')) {
-      errorMessage = 'User profile not found in database';
-    } else if (error.message.includes('network error')) {
-      errorMessage = 'Network error - please check your connection';
-    }
-
-    alert(`${errorMessage}. Please try again.`);
-    return false;
+    console.error("Error approving user:", error);
+    alert("Failed to approve user. Please try again.");
   }
 };
 
@@ -1392,390 +1293,336 @@ export default function MeetingRoom() {
     }
   };
 
-  const joinMeeting = useCallback(async (meetingId, userId) => {
-    if (isJoining) return;
-    setIsJoining(true);
-    setConnectionStatus("Connecting...");
+  const joinMeeting = useCallback(
+    async (meetingId, userId) => {
+      if (isJoining) return;
+      setIsJoining(true);
+      setConnectionStatus("Connecting...");
 
-    try {
-      // Ensure we have media permissions
-      const stream = await requestMediaPermissions();
-      
-      // Create or reuse peer connection
-      if (!peerRef.current || peerRef.current.destroyed) {
+      try {
+        const stream = await requestMediaPermissions();
+        updateParticipants(meetingId);
+
         const peer = createPeer(userId);
         peerRef.current = peer;
-        await setupPeerHandlers(peer, meetingId, userId);
+
+        peer.on("open", async (pid) => {
+          try {
+            setParticipantNames((prev) => ({
+              ...prev,
+              [pid]: user?.email || pid,
+            }));
+
+            let attempts = 0;
+            const maxAttempts = 3;
+
+            while (attempts < maxAttempts) {
+              try {
+                const { error } = await supabase.from("signals").upsert(
+                  {
+                    room_id: roomId,
+                    peer_id: pid,
+                    user_id: userId,
+                    last_active: new Date().toISOString(),
+                  },
+                  {
+                    onConflict: "room_id,peer_id",
+                    ignoreDuplicates: false,
+                  }
+                );
+
+                if (error) throw error;
+                break;
+              } catch (err) {
+                attempts++;
+                if (attempts >= maxAttempts) throw err;
+                await new Promise((resolve) =>
+                  setTimeout(resolve, 1000 * attempts)
+                );
+              }
+            }
+
+            const { data: others } = await supabase
+              .from("signals")
+              .select("*")
+              .eq("room_id", roomId)
+              .neq("peer_id", pid)
+              .order("last_active", { ascending: false });
+
+            if (others?.length > 0) {
+              const MAX_CONCURRENT_CONNECTIONS = 3;
+              const connectionGroups = [];
+
+              for (
+                let i = 0;
+                i < others.length;
+                i += MAX_CONCURRENT_CONNECTIONS
+              ) {
+                connectionGroups.push(
+                  others.slice(i, i + MAX_CONCURRENT_CONNECTIONS)
+                );
+              }
+
+              for (const group of connectionGroups) {
+                await Promise.all(group.map((o) => connectToPeer(o.peer_id)));
+              }
+            }
+
+            if (!signalsChannel.current) {
+              signalsChannel.current = supabase
+                .channel(`signals:${roomId}`)
+                .on(
+                  "postgres_changes",
+                  {
+                    event: "*",
+                    schema: "public",
+                    table: "signals",
+                    filter: `room_id=eq.${roomId}`,
+                  },
+                  (payload) => {
+                    if (payload.new.peer_id !== pid) {
+                      if (
+                        payload.eventType === "INSERT" ||
+                        payload.eventType === "UPDATE"
+                      ) {
+                        if (!peerConnectionsRef.current[payload.new.peer_id]) {
+                          connectToPeer(payload.new.peer_id);
+                        }
+                      } else if (payload.eventType === "DELETE") {
+                        removeRemote(payload.old.peer_id);
+                      }
+                    }
+                  }
+                )
+                .subscribe((status, err) => {
+                  if (err) {
+                    setTimeout(() => {
+                      if (signalsChannel.current) {
+                        signalsChannel.current.subscribe();
+                      }
+                    }, 2000);
+                  }
+                });
+            }
+          } catch (err) {
+            console.error("Error in peer open handler:", err);
+            setTimeout(() => {
+              if (peerRef.current && !peerRef.current.destroyed) {
+                joinMeeting(meetingId, userId);
+              }
+            }, 3000);
+          }
+        });
+
+        peer.on("call", (call) => {
+          try {
+            const streamToAnswerWith =
+              isScreenSharing && screenStreamRef.current
+                ? new MediaStream([
+                    ...screenStreamRef.current.getVideoTracks(),
+                    ...localStreamRef.current.getAudioTracks(),
+                  ])
+                : localStreamRef.current;
+
+            call.answer(streamToAnswerWith);
+            peerConnectionsRef.current[call.peer] = call;
+            activePeerConnections.current.add(call.peer);
+            setupCall(call, call.peer);
+          } catch (err) {
+            console.error("Error answering call:", err);
+            setTimeout(() => {
+              if (localStreamRef.current) {
+                call.answer(localStreamRef.current);
+                peerConnectionsRef.current[call.peer] = call;
+                activePeerConnections.current.add(call.peer);
+                setupCall(call, call.peer);
+              }
+            }, 1000);
+          }
+        });
+
+        setIsJoining(false);
+      } catch (err) {
+        console.error("Join meeting error:", err);
+        setIsJoining(false);
+        setTimeout(() => joinMeeting(meetingId, userId), 5000);
       }
+    },
+    [isJoining, isScreenSharing, roomId, user?.email]
+  );
 
-      setConnectionStatus("Connected");
-      setIsJoining(false);
-    } catch (err) {
-      console.error("Join meeting error:", err);
-      setIsJoining(false);
-      setTimeout(() => joinMeeting(meetingId, userId), 5000);
+  const setupParticipantsListener = useCallback((mtId) => {
+    if (!participantsChannel.current) {
+      participantsChannel.current = supabase
+        .channel(`participants:${mtId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "participants",
+            filter: `meeting_id=eq.${mtId}`,
+          },
+          (payload) => {
+            if (participantUpdateTimeoutRef.current) {
+              clearTimeout(participantUpdateTimeoutRef.current);
+            }
+            participantUpdateTimeoutRef.current = setTimeout(() => {
+              updateParticipants(mtId);
+            }, 500);
+          }
+        )
+        .subscribe();
     }
-  }, [isJoining]);
+  }, []);
 
-
-  const setupParticipantsListener = useCallback((mtId, uid) => {
-    if (participantListener.current) {
-      supabase.removeChannel(participantListener.current);
-    }
-
-    participantListener.current = supabase
-      .channel(`participant:${mtId}:${uid}`)
+  const setupApprovalListener = useCallback((userId) => {
+  if (!approvalChannel.current) {
+    approvalChannel.current = supabase
+      .channel(`approval:${userId}`)
       .on(
         "postgres_changes",
         {
-          event: "UPDATE",
+          event: "INSERT",
           schema: "public",
-          table: "participants",
-          filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
+          table: "approval_signals",
+          filter: `user_id=eq.${userId}`,
         },
         async (payload) => {
-          if (payload.new.status === "approved") {
+          console.log("Approval signal received:", payload);
+          
+          // Verify the approval in participants table
+          const { data: participant } = await supabase
+            .from("participants")
+            .select("status")
+            .eq("meeting_id", meetingDbId)
+            .eq("user_id", userId)
+            .single();
+
+          if (participant?.status === "approved") {
             setWaitingForApproval(false);
             setPermitToJoin(true);
             
             try {
-              // Request media permissions if not already done
-              if (!localStreamRef.current) {
-                await requestMediaPermissions();
-              }
+              await requestMediaPermissions();
               
-              // Initialize peer if not already done
-              if (!peerRef.current || peerRef.current.destroyed) {
-                const peer = createPeer(uid);
-                peerRef.current = peer;
-                await setupPeerHandlers(peer, mtId, uid);
+              if (!peerRef.current?.id) {
+                await joinMeeting(meetingDbId, userId);
               }
-              
-              // Connect to existing peers
-              if (peerRef.current?.id) {
-                const { data: others, error } = await supabase
-                  .from("signals")
-                  .select("peer_id, user_id")
-                  .eq("room_id", roomId)
-                  .neq("peer_id", peerRef.current.id);
-                
-                if (!error && others?.length > 0) {
-                  await Promise.all(
-                    others.map(({ peer_id }) => {
-                      if (!peerConnectionsRef.current[peer_id]) {
-                        return connectToPeer(peer_id);
-                      }
-                      return Promise.resolve();
-                    })
-                  );
-                }
+
+              // Connect to existing participants
+              const { data: others } = await supabase
+                .from("signals")
+                .select("peer_id, user_id")
+                .eq("room_id", roomId)
+                .neq("peer_id", peerRef.current?.id || "");
+
+              if (others?.length > 0) {
+                await Promise.all(
+                  others.map(({ peer_id }) => {
+                    if (!peerConnectionsRef.current[peer_id]) {
+                      return connectToPeer(peer_id);
+                    }
+                    return Promise.resolve();
+                  })
+                );
               }
             } catch (err) {
               console.error("Error joining after approval:", err);
-              setTimeout(() => setupParticipantListener(mtId, uid), 3000);
+              // Retry after delay
+              setTimeout(() => {
+                if (isMountedRef.current) {
+                  setupApprovalListener(userId);
+                }
+              }, 3000);
             }
-          } else if (payload.new.status === "denied") {
-            setWaitingForApproval(false);
-            alert("Your request to join was denied by the host");
-            navigate("/");
           }
         }
       )
       .subscribe((status, err) => {
         if (err) {
-          console.error("Participant listener subscription error:", err);
-          setTimeout(() => setupParticipantListener(mtId, uid), 2000);
+          console.error("Approval listener error:", err);
+          setTimeout(() => {
+            if (isMountedRef.current) {
+              setupApprovalListener(userId);
+            }
+          }, 2000);
         }
       });
-  }, [navigate, roomId]);
-
-  const setupPeerHandlers = async (peer, meetingId, userId) => {
-    // Handle peer open event
-    peer.on("open", async (pid) => {
-      try {
-        setParticipantNames((prev) => ({
-          ...prev,
-          [pid]: user?.email || pid,
-        }));
-
-        // Upsert our signal to the database
-        const { error: signalError } = await supabase.from("signals").upsert(
-          {
-            room_id: roomId,
-            peer_id: pid,
-            user_id: userId,
-            last_active: new Date().toISOString(),
-          },
-          { onConflict: "room_id,peer_id" }
-        );
-
-        if (signalError) throw signalError;
-
-        // Setup signals channel
-        if (!signalsChannel.current) {
-          signalsChannel.current = supabase
-            .channel(`signals:${roomId}`)
-            .on(
-              "postgres_changes",
-              {
-                event: "*",
-                schema: "public",
-                table: "signals",
-                filter: `room_id=eq.${roomId}`,
-              },
-              (payload) => {
-                if (payload.new.peer_id !== pid) {
-                  if (
-                    payload.eventType === "INSERT" ||
-                    payload.eventType === "UPDATE"
-                  ) {
-                    if (!peerConnectionsRef.current[payload.new.peer_id]) {
-                      connectToPeer(payload.new.peer_id);
-                    }
-                  } else if (payload.eventType === "DELETE") {
-                    removeRemote(payload.old.peer_id);
-                  }
-                }
-              }
-            )
-            .subscribe();
-        }
-
-        setConnectionStatus("Connected");
-      } catch (err) {
-        console.error("Peer open handler error:", err);
-        setTimeout(() => peer.reconnect(), 3000);
-      }
-    });
-
-    // Handle incoming calls
-    peer.on("call", (call) => {
-      try {
-        const streamToAnswerWith = isScreenSharing && screenStreamRef.current
-          ? new MediaStream([
-              ...screenStreamRef.current.getVideoTracks(),
-              ...localStreamRef.current.getAudioTracks(),
-            ])
-          : localStreamRef.current;
-
-        call.answer(streamToAnswerWith);
-        peerConnectionsRef.current[call.peer] = call;
-        activePeerConnections.current.add(call.peer);
-        
-        // Setup call handlers (same as in connectToPeer)
-        call.on("stream", (remoteStream) => {
-          // ... same stream handler as in connectToPeer
-        });
-        
-        call.on("close", () => {
-          // ... same close handler as in connectToPeer
-        });
-        
-        call.on("error", (err) => {
-          // ... same error handler as in connectToPeer
-        });
-        
-        call.on("iceStateChanged", (state) => {
-          // ... same ice state handler as in connectToPeer
-        });
-      } catch (err) {
-        console.error("Error answering call:", err);
-        setTimeout(() => {
-          if (localStreamRef.current) {
-            call.answer(localStreamRef.current);
-          }
-        }, 1000);
-      }
-    });
-
-    // Handle disconnections
-    peer.on("disconnected", () => {
-      setConnectionStatus("Disconnected - reconnecting");
-      peer.reconnect();
-    });
-
-    peer.on("error", (err) => {
-      console.error("PeerJS error:", err);
-      setConnectionStatus(`Error: ${err.type}`);
-      
-      if (err.type === "peer-unavailable") {
-        setTimeout(() => peer.reconnect(), 2000);
-      } else if (err.type === "socket-error") {
-        setTimeout(() => peer.reconnect(), 2000);
-      } else if (err.type === "network") {
-        setTimeout(() => peer.reconnect(), 3000);
-      }
-    });
-  };
-// Add this to your useEffect cleanup
-useEffect(() => {
-  return () => {
-    // Clean up all peer connections
-    Object.values(peerConnectionsRef.current).forEach(conn => {
-      if (conn.close) conn.close();
-    });
-    
-    // Clean up all media streams
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-    
-    // Clean up all Supabase channels
-    const channels = [
-      signalsChannel,
-      waitingChannel,
-      participantListener,
-      messagesChannel,
-      reactionsChannel,
-      participantsChannel
-    ];
-    
-    channels.forEach(channelRef => {
-      if (channelRef.current) {
-        supabase.removeChannel(channelRef.current);
-      }
-    });
-  };
-}, []);
-
-// Add this useEffect to monitor connection status
-useEffect(() => {
-  const checkConnectionStatus = () => {
-    if (!peerRef.current) return;
-    
-    if (peerRef.current.disconnected) {
-      setConnectionStatus("Disconnected - reconnecting");
-      peerRef.current.reconnect();
-    } else if (!peerRef.current.open) {
-      setConnectionStatus("Connecting...");
-    } else {
-      setConnectionStatus("Connected");
-    }
-  };
-
-  const interval = setInterval(checkConnectionStatus, 5000);
-  return () => clearInterval(interval);
-}, []);
+  }
+}, [meetingDbId, roomId]);
 
   const initRoom = useCallback(async () => {
-    if (isInitialized || !isMountedRef.current) return;
+  if (isInitialized || !isMountedRef.current) return;
 
-    try {
-      setIsInitialized(true);
+  try {
+    setIsInitialized(true);
 
-      // Get current user
-      const { data: auth, error: authError } = await supabase.auth.getUser();
-      if (authError || !auth?.user) throw new Error("Not authenticated");
+    const { data: auth, error: authError } = await supabase.auth.getUser();
+    if (authError || !auth?.user) throw new Error("Not authenticated");
 
-      await ensureProfileExists(auth.user.id);
-      setUser(auth.user);
+    await ensureProfileExists(auth.user.id);
+    setUser(auth.user);
 
-      // Get meeting details
-      let mt;
-      let retries = 0;
-      while (retries < 3) {
-        try {
-          const { data, error } = await supabase
-            .from("meetings")
-            .select("*")
-            .eq("room_id", roomId)
-            .maybeSingle();
+    // Get meeting data
+    const { data: meeting } = await supabase
+      .from("meetings")
+      .select("*")
+      .eq("room_id", roomId)
+      .maybeSingle();
 
-          if (error) throw error;
-          if (!data) throw new Error("Meeting not found");
+    if (!meeting) throw new Error("Meeting not found");
 
-          mt = data;
-          break;
-        } catch (err) {
-          retries++;
-          if (retries >= 3) throw err;
-          await new Promise((resolve) => setTimeout(resolve, 1000 * retries));
-        }
-      }
+    setMeetingDbId(meeting.id);
+    const isHost = auth.user.id === meeting.creator_id;
+    setIsHost(isHost);
+    setPasscodeRequired(!!meeting.passcode);
 
-      setMeetingDbId(mt.id);
-      const hostStatus = auth.user.id === mt.creator_id;
-      setIsHost(hostStatus);
-      setPasscodeRequired(!!mt.passcode);
+    // Check passcode
+    const providedPass = new URLSearchParams(search).get("passcode") || inputPasscode;
+    if (meeting.passcode && providedPass !== meeting.passcode) {
+      setNeedPasscode(true);
+      return;
+    }
 
-      // Check passcode
-      const providedPass = new URLSearchParams(search).get("passcode") || inputPasscode;
-      if (mt.passcode && providedPass !== mt.passcode) {
-        setNeedPasscode(true);
-        return;
-      }
+    setNeedPasscode(false);
+    loadMessagesAndReactions();
 
-      setNeedPasscode(false);
-      loadMessagesAndReactions();
+    if (isHost) {
+      setPermitToJoin(true);
+      await requestMediaPermissions();
+      await joinMeeting(meeting.id, auth.user.id);
+      setupWaitingListener(meeting.id);
+    } else {
+      // Check participant status
+      const { data: participant } = await supabase
+        .from("participants")
+        .select("status")
+        .eq("meeting_id", meeting.id)
+        .eq("user_id", auth.user.id)
+        .maybeSingle();
 
-      if (hostStatus) {
-        // Host flow
+      if (!participant) {
+        await createPendingRequest(meeting.id, auth.user.id);
+        setupApprovalListener(auth.user.id); // Set up approval listener
+      } else if (participant.status === "approved") {
         setPermitToJoin(true);
-        try {
-          await requestMediaPermissions();
-          await joinMeeting(mt.id, auth.user.id);
-          setupWaitingListener(mt.id);
-        } catch (err) {
-          console.error("Host setup error:", err);
-          setTimeout(() => initRoom(), 3000);
-        }
-      } else {
-        // Participant flow
-        let existing;
-        try {
-          const { data } = await supabase
-            .from("participants")
-            .select("status")
-            .eq("meeting_id", mt.id)
-            .eq("user_id", auth.user.id)
-            .maybeSingle();
-          existing = data;
-        } catch (err) {
-          console.error("Error checking participant status:", err);
-          setTimeout(() => initRoom(), 2000);
-          return;
-        }
-
-        if (!existing || existing.status === "pending") {
-          setupParticipantListener(mt.id, auth.user.id);
-
-          if (!existing) {
-            await createPendingRequest(mt.id, auth.user.id);
-          } else {
-            setWaitingForApproval(true);
-          }
-        } else if (existing.status === "approved") {
-          setPermitToJoin(true);
-          try {
-            await requestMediaPermissions();
-            await joinMeeting(mt.id, auth.user.id);
-          } catch (err) {
-            console.error("Approved participant setup error:", err);
-            setTimeout(() => initRoom(), 3000);
-          }
-        } else if (existing.status === "denied") {
-          navigate("/");
-        }
-      }
-    } catch (error) {
-      console.error("Init room error:", error);
-      if (isMountedRef.current) {
-        setIsInitialized(false);
-        alert(error.message || "Failed to initialize room");
-        setTimeout(() => initRoom(), 5000);
+        setWaitingForApproval(false);
+        await requestMediaPermissions();
+        await joinMeeting(meeting.id, auth.user.id);
+      } else if (participant.status === "pending") {
+        setWaitingForApproval(true);
+        setupApprovalListener(auth.user.id); // Set up approval listener
+      } else if (participant.status === "denied") {
+        navigate("/");
       }
     }
-  }, [
-    inputPasscode,
-    navigate,
-    roomId,
-    search,
-    setupParticipantListener,
-    setupWaitingListener,
-  ]);
+  } catch (error) {
+    console.error("Init room error:", error);
+    setIsInitialized(false);
+    setTimeout(() => initRoom(), 5000);
+  }
+}, [inputPasscode, navigate, roomId, search, setupApprovalListener, setupWaitingListener]);
 
   useEffect(() => {
     const pass = new URLSearchParams(search).get("passcode") || "";
