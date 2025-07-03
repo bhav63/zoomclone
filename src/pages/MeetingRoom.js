@@ -23,6 +23,8 @@ export default function MeetingRoom() {
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
+
+  const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
   
   const [participants, setParticipants] = useState([]);
   const [permitToJoin, setPermitToJoin] = useState(false);
@@ -312,33 +314,49 @@ export default function MeetingRoom() {
     [roomId, user?.id]
   );
 
- const updateParticipants = async (meetingId) => {
+const updateParticipants = async (meetingId) => {
   try {
-    const { data, error } = await supabase
+    // Get all participants with their emails
+    const { data: participantsData, error: participantsError } = await supabase
       .from('participants')
       .select('user_id, email')
       .eq('meeting_id', meetingId)
       .eq('status', 'approved');
 
-    if (error) throw error;
+    if (participantsError) throw participantsError;
 
-    if (data) {
-      setParticipants(data);
-      
-      // Create a mapping of user_id to email
-      const emailMap = {};
-      data.forEach(p => {
-        emailMap[p.user_id] = p.email;
+    // Get all active signals (peer connections)
+    const { data: signalsData, error: signalsError } = await supabase
+      .from('signals')
+      .select('peer_id, user_id')
+      .eq('room_id', roomId);
+
+    if (signalsError) throw signalsError;
+
+    if (participantsData && signalsData) {
+      setParticipants(participantsData);
+
+      // Create mapping of user_id to email
+      const userToEmailMap = {};
+      participantsData.forEach(p => {
+        userToEmailMap[p.user_id] = p.email;
       });
 
-      // Update participant names for all active connections
-      const newNames = {...participantNames};
-      Object.entries(peerConnectionsRef.current).forEach(([peerId, conn]) => {
-        if (emailMap[conn.peer]) {
-          newNames[peerId] = emailMap[conn.peer];
+      // Create mapping of peer_id to user_id
+      const newPeerToUserIdMap = {};
+      signalsData.forEach(s => {
+        newPeerToUserIdMap[s.peer_id] = s.user_id;
+      });
+      setPeerToUserIdMap(newPeerToUserIdMap);
+
+      // Create mapping of peer_id to email
+      const newParticipantNames = {};
+      signalsData.forEach(s => {
+        if (userToEmailMap[s.user_id]) {
+          newParticipantNames[s.peer_id] = userToEmailMap[s.user_id];
         }
       });
-      setParticipantNames(newNames);
+      setParticipantNames(newParticipantNames);
     }
   } catch (error) {
     console.error("Error updating participants:", error);
@@ -901,7 +919,7 @@ export default function MeetingRoom() {
     }, 5000);
   };
 
-  const addRemote = (id, stream) => {
+ const addRemote = (id, stream) => {
   if (remoteVideosRef.current[id]) return;
 
   const div = document.createElement("div");
@@ -914,13 +932,15 @@ export default function MeetingRoom() {
   vid.playsInline = true;
   vid.className = "w-full h-full object-cover";
 
-  // Create participant label with email
-  const label = document.createElement("div");
-  label.className = 
-    "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
-  
-  // Use the email from participantNames if available, otherwise fallback
-  label.textContent = participantNames[id] || `User ${id.slice(-4)}`;
+  // Only create label if we have an email for this participant
+  const participantEmail = participantNames[id];
+  if (participantEmail) {
+    const label = document.createElement("div");
+    label.className = 
+      "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+    label.textContent = participantEmail;
+    div.appendChild(label);
+  }
 
   // Speaking indicator
   const speakingIndicator = document.createElement("div");
@@ -930,7 +950,6 @@ export default function MeetingRoom() {
 
   // Add elements to DOM
   div.appendChild(vid);
-  div.appendChild(label);
   div.appendChild(speakingIndicator);
   remoteVideosRef.current[id] = div;
 
@@ -941,9 +960,12 @@ export default function MeetingRoom() {
   const updateLabel = () => {
     if (!isMountedRef.current) return;
     
-    const currentLabel = div.querySelector('.participant-label');
-    if (currentLabel) {
-      currentLabel.textContent = participantNames[id] || `User ${id.slice(-4)}`;
+    // Only update if we have a label element
+    if (participantEmail) {
+      const currentLabel = div.querySelector('.participant-label');
+      if (currentLabel) {
+        currentLabel.textContent = participantNames[id] || `User ${id.slice(-4)}`;
+      }
     }
     
     const indicator = div.querySelector(`#speaking-${id}`);
