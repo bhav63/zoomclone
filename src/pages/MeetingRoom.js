@@ -23,6 +23,7 @@ export default function MeetingRoom() {
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
+  const [participantData, setParticipantData] = useState({});
   const [participants, setParticipants] = useState([]);
   const [permitToJoin, setPermitToJoin] = useState(false);
   const [meetingDbId, setMeetingDbId] = useState(null);
@@ -311,32 +312,52 @@ export default function MeetingRoom() {
     [roomId, user?.id]
   );
 
- const updateParticipants = async (meetingId) => {
-  const { data } = await supabase
-    .from('participants')
-    .select('user_id, email')
-    .eq('meeting_id', meetingId)
-    .eq('status', 'approved');
+  const updateParticipants = async (meetingId) => {
+    try {
+      const { data, error } = await supabase
+        .from("participants")
+        .select(
+          `
+        user_id, 
+        email,
+        display_name,
+        profiles(name, avatar_url)
+      `
+        )
+        .eq("meeting_id", meetingId)
+        .eq("status", "approved");
 
-  if (data) {
-    setParticipants(data);
-    
-    // Update names mapping
-    const names = {};
-    data.forEach(p => {
-      if (p.email) {
-        // Find the peer ID for this user
-        const peerId = Object.entries(peerConnectionsRef.current)
-          .find(([_, conn]) => conn.peer === p.user_id)?.[0];
-        
-        if (peerId) {
-          names[peerId] = p.email;
+      if (error) throw error;
+
+      // Update participants list
+      setParticipants(data || []);
+
+      // Create mapping of user_id to participant data
+      const userDataMap = {};
+      data?.forEach((p) => {
+        userDataMap[p.user_id] = {
+          email: p.email,
+          name: p.display_name || p.profiles?.name,
+          avatar: p.profiles?.avatar_url,
+        };
+      });
+
+      // Update participantNames by finding peer IDs for each user
+      const newNames = { ...participantNames };
+      Object.entries(peerConnectionsRef.current).forEach(([peerId, conn]) => {
+        const userId = conn.peer; // Assuming peer connection has user ID
+        if (userDataMap[userId]) {
+          newNames[peerId] =
+            userDataMap[userId].name || userDataMap[userId].email;
         }
-      }
-    });
-    setParticipantNames(names);
-  }
-};
+      });
+
+      setParticipantNames(newNames);
+      setParticipantData(userDataMap);
+    } catch (error) {
+      console.error("Error updating participants:", error);
+    }
+  };
 
   const updateWaitingList = async (meetingId) => {
     try {
@@ -761,12 +782,13 @@ export default function MeetingRoom() {
 
   const connectToPeer = async (peerId) => {
     if (!peerRef.current || !localStreamRef.current) return;
-
     if (pendingPeerConnections.current.has(peerId)) return;
 
     pendingPeerConnections.current.add(peerId);
+    setConnectionStatus(`Connecting to ${peerId.slice(0, 8)}...`);
 
     try {
+      // Check for existing connection
       if (peerConnectionsRef.current[peerId]) {
         const existingConnection = peerConnectionsRef.current[peerId];
         if (existingConnection.open) {
@@ -775,15 +797,18 @@ export default function MeetingRoom() {
         }
       }
 
+      // Initialize retry counter if not exists
       if (!retryCountsRef.current[peerId]) {
         retryCountsRef.current[peerId] = 0;
       }
 
+      // Give up after 5 attempts
       if (retryCountsRef.current[peerId] >= 5) {
         pendingPeerConnections.current.delete(peerId);
         return;
       }
 
+      // Prepare the stream to send (screen share or camera)
       const streamToSend =
         isScreenSharing && screenStreamRef.current
           ? new MediaStream([
@@ -792,22 +817,136 @@ export default function MeetingRoom() {
             ])
           : localStreamRef.current;
 
+      // Initiate the call
       const call = peerRef.current.call(peerId, streamToSend);
       peerConnectionsRef.current[peerId] = call;
       activePeerConnections.current.add(peerId);
-      setupCall(call, peerId);
 
+      // Setup call handlers
+      call.on("stream", async (remoteStream) => {
+        try {
+          // Initialize audio context if not exists
+          if (!audioContextRef.current) {
+            const AudioContext =
+              window.AudioContext || window.webkitAudioContext;
+            audioContextRef.current = new AudioContext();
+          }
+
+          // Setup audio analysis
+          const analyser = audioContextRef.current.createAnalyser();
+          analyser.fftSize = 512;
+          const source =
+            audioContextRef.current.createMediaStreamSource(remoteStream);
+          source.connect(analyser);
+          analysersRef.current[peerId] = analyser;
+
+          // Add the remote video element
+          addRemote(peerId, remoteStream);
+          setConnectionStatus("Connected");
+
+          // Start connection stats if not already running
+          if (!statsIntervalRef.current) {
+            startConnectionStats();
+          }
+
+          // Get user info for this peer
+          const { data: signalData, error: signalError } = await supabase
+            .from("signals")
+            .select("user_id")
+            .eq("peer_id", peerId)
+            .single();
+
+          if (signalError) throw signalError;
+
+          if (signalData?.user_id) {
+            // Get participant details
+            const { data: participant, error: participantError } =
+              await supabase
+                .from("participants")
+                .select(
+                  `
+              email,
+              display_name,
+              profiles(name)
+            `
+                )
+                .eq("user_id", signalData.user_id)
+                .eq("meeting_id", meetingDbId)
+                .single();
+
+            if (participantError) throw participantError;
+
+            if (participant) {
+              const displayName =
+                participant.display_name ||
+                participant.profiles?.name ||
+                participant.email ||
+                `User ${signalData.user_id.slice(0, 4)}`;
+
+              // Update participant name
+              setParticipantNames((prev) => ({
+                ...prev,
+                [peerId]: displayName,
+              }));
+
+              // Update participant data mapping
+              setParticipantData((prev) => ({
+                ...prev,
+                [peerId]: {
+                  userId: signalData.user_id,
+                  email: participant.email,
+                  name: displayName,
+                },
+              }));
+            }
+          }
+        } catch (error) {
+          console.error("Error handling remote stream:", error);
+        }
+      });
+
+      call.on("close", () => {
+        removeRemote(peerId);
+        delete peerConnectionsRef.current[peerId];
+        activePeerConnections.current.delete(peerId);
+        delete analysersRef.current[peerId];
+        setConnectionStatus("Disconnected");
+      });
+
+      call.on("error", (err) => {
+        console.error("Call error with", peerId, ":", err);
+        removeRemote(peerId);
+        delete peerConnectionsRef.current[peerId];
+        activePeerConnections.current.delete(peerId);
+        delete analysersRef.current[peerId];
+        setConnectionStatus(`Error: ${err.message}`);
+      });
+
+      call.on("iceStateChanged", (state) => {
+        if (state === "disconnected" || state === "failed") {
+          setTimeout(() => connectToPeer(peerId), 2000);
+        }
+      });
+
+      // Reset retry counter on successful connection
       retryCountsRef.current[peerId] = 0;
     } catch (err) {
       console.error(`Connection attempt failed to ${peerId}:`, err);
+
+      // Increment retry counter
       retryCountsRef.current[peerId] += 1;
+
+      // Clean up failed connection
       delete peerConnectionsRef.current[peerId];
       activePeerConnections.current.delete(peerId);
+      delete analysersRef.current[peerId];
 
+      // Exponential backoff for retries
       const delay = Math.min(
         1000 * Math.pow(2, retryCountsRef.current[peerId]),
-        8000
+        8000 // Max 8 seconds
       );
+
       setTimeout(() => connectToPeer(peerId), delay);
     } finally {
       pendingPeerConnections.current.delete(peerId);
@@ -907,6 +1046,7 @@ export default function MeetingRoom() {
     vid.playsInline = true;
     vid.className = "w-full h-full object-cover";
 
+    // Audio context setup
     if (!audioContextRef.current) {
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       audioContextRef.current = new AudioContext();
@@ -918,13 +1058,15 @@ export default function MeetingRoom() {
     source.connect(analyser);
     analysersRef.current[id] = analyser;
 
+    // Create participant label with smooth transitions
     const label = document.createElement("div");
     label.className =
       "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
-    label.textContent = participantNames[id] || id;
-    label.style.transition = 'opacity 0.3s';  // Add transition for smooth animation
-    label.style.opacity = '1';  // Start visible
+    label.textContent = participantNames[id] || `Participant ${id.slice(-4)}`;
+    label.style.transition = "opacity 0.3s";
+    label.style.opacity = "1";
 
+    // Other UI elements
     const speakingIndicator = document.createElement("div");
     speakingIndicator.className =
       "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
@@ -935,6 +1077,7 @@ export default function MeetingRoom() {
       "absolute top-2 left-2 bg-black bg-opacity-50 text-white text-xs px-1 rounded";
     statsElement.id = `stats-${id}`;
 
+    // Add elements to DOM
     div.appendChild(vid);
     div.appendChild(label);
     div.appendChild(speakingIndicator);
@@ -944,45 +1087,30 @@ export default function MeetingRoom() {
     const container = document.getElementById("remote-videos");
     if (container) container.appendChild(div);
 
-    // Function to update name when it changes
+    // Function to update name when participantNames changes
     const updateName = () => {
       if (!isMountedRef.current) return;
-      
-      if (participantNames[id] && label.textContent !== participantNames[id]) {
-        label.style.opacity = '0';
+
+      const currentLabel = document.querySelector(
+        `#remote-${id} .participant-label`
+      );
+      if (
+        currentLabel &&
+        participantNames[id] &&
+        currentLabel.textContent !== participantNames[id]
+      ) {
+        currentLabel.style.opacity = "0";
         setTimeout(() => {
-          label.textContent = participantNames[id];
-          label.style.opacity = '1';
+          currentLabel.textContent = participantNames[id];
+          currentLabel.style.opacity = "1";
         }, 300);
       }
       requestAnimationFrame(updateName);
     };
 
-    const updateUIElements = () => {
-      if (!isMountedRef.current) return;
-
-      const indicator = document.getElementById(`speaking-${id}`);
-      if (indicator) {
-        indicator.className = `absolute top-2 right-2 w-3 h-3 rounded-full ${
-          activeSpeakers[id] ? "bg-green-500" : "bg-transparent"
-        }`;
-      }
-
-      const statsDisplay = document.getElementById(`stats-${id}`);
-      if (statsDisplay && connectionStats[id]) {
-        const { rtt, packetsLost } = connectionStats[id];
-        statsDisplay.textContent = `${Math.round(rtt * 1000)}ms ${
-          packetsLost > 0 ? "⚠️" : ""
-        }`;
-      }
-
-      requestAnimationFrame(updateUIElements);
-    };
-
-    // Start both update loops
+    // Start the update loop
     updateName();
-    updateUIElements();
-};
+  };
 
   const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
@@ -1322,110 +1450,110 @@ export default function MeetingRoom() {
   };
 
   // Add this state
-const [approvalCheckCount, setApprovalCheckCount] = useState(0);
+  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
 
-// Enhanced approval handling
-useEffect(() => {
-  if (!waitingForApproval || !meetingDbId || !user?.id) return;
+  // Enhanced approval handling
+  useEffect(() => {
+    if (!waitingForApproval || !meetingDbId || !user?.id) return;
 
-  // Real-time listener (primary method)
-  const listener = supabase
-    .channel(`approval:${meetingDbId}:${user.id}`)
-    .on(
-      "postgres_changes",
-      {
-        event: "UPDATE",
-        schema: "public",
-        table: "participants",
-        filter: `meeting_id=eq.${meetingDbId},user_id=eq.${user.id}`,
-      },
-      (payload) => {
-        if (payload.new.status === "approved") {
+    // Real-time listener (primary method)
+    const listener = supabase
+      .channel(`approval:${meetingDbId}:${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${meetingDbId},user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          if (payload.new.status === "approved") {
+            handleApproval();
+          }
+        }
+      )
+      .subscribe();
+
+    // Polling fallback
+    const interval = setInterval(async () => {
+      try {
+        const { data } = await supabase
+          .from("participants")
+          .select("status")
+          .eq("meeting_id", meetingDbId)
+          .eq("user_id", user.id)
+          .single();
+
+        if (data?.status === "approved") {
           handleApproval();
+          clearInterval(interval);
+        } else {
+          setApprovalCheckCount((prev) => prev + 1);
         }
+      } catch (error) {
+        console.error("Approval check error:", error);
       }
-    )
-    .subscribe();
+    }, 10000); // Check every 10 seconds
 
-  // Polling fallback
-  const interval = setInterval(async () => {
+    const handleApproval = () => {
+      setWaitingForApproval(false);
+      setPermitToJoin(true);
+      clearInterval(interval);
+      supabase.removeChannel(listener);
+
+      // Initialize meeting connection
+      initializeAfterApproval();
+    };
+
+    return () => {
+      clearInterval(interval);
+      supabase.removeChannel(listener);
+    };
+  }, [waitingForApproval, meetingDbId, user?.id]);
+
+  const initializeAfterApproval = async () => {
     try {
-      const { data } = await supabase
-        .from("participants")
-        .select("status")
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", user.id)
-        .single();
+      await requestMediaPermissions();
 
-      if (data?.status === "approved") {
-        handleApproval();
-        clearInterval(interval);
-      } else {
-        setApprovalCheckCount(prev => prev + 1);
-      }
-    } catch (error) {
-      console.error("Approval check error:", error);
-    }
-  }, 10000); // Check every 10 seconds
+      if (!peerRef.current) {
+        const peer = createPeer(user.id);
+        peerRef.current = peer;
 
-  const handleApproval = () => {
-    setWaitingForApproval(false);
-    setPermitToJoin(true);
-    clearInterval(interval);
-    supabase.removeChannel(listener);
-    
-    // Initialize meeting connection
-    initializeAfterApproval();
-  };
+        peer.on("open", async (id) => {
+          await supabase.from("signals").upsert({
+            room_id: roomId,
+            peer_id: id,
+            user_id: user.id,
+            last_active: new Date().toISOString(),
+          });
 
-  return () => {
-    clearInterval(interval);
-    supabase.removeChannel(listener);
-  };
-}, [waitingForApproval, meetingDbId, user?.id]);
+          // Connect to existing participants
+          const { data: others } = await supabase
+            .from("signals")
+            .select("peer_id")
+            .eq("room_id", roomId)
+            .neq("peer_id", id);
 
-const initializeAfterApproval = async () => {
-  try {
-    await requestMediaPermissions();
-    
-    if (!peerRef.current) {
-      const peer = createPeer(user.id);
-      peerRef.current = peer;
-      
-      peer.on("open", async (id) => {
-        await supabase.from("signals").upsert({
-          room_id: roomId,
-          peer_id: id,
-          user_id: user.id,
-          last_active: new Date().toISOString(),
+          if (others?.length > 0) {
+            others.forEach(({ peer_id }) => connectToPeer(peer_id));
+          }
         });
-        
-        // Connect to existing participants
-        const { data: others } = await supabase
-          .from("signals")
-          .select("peer_id")
-          .eq("room_id", roomId)
-          .neq("peer_id", id);
-          
-        if (others?.length > 0) {
-          others.forEach(({ peer_id }) => connectToPeer(peer_id));
-        }
-      });
-      
-      peer.on("call", (call) => {
-        call.answer(localStreamRef.current);
-        setupCall(call, call.peer);
-      });
+
+        peer.on("call", (call) => {
+          call.answer(localStreamRef.current);
+          setupCall(call, call.peer);
+        });
+      }
+
+      await updateParticipants(meetingDbId);
+      setConnectionStatus("Connected to meeting");
+    } catch (error) {
+      console.error("Post-approval initialization error:", error);
+      setConnectionStatus("Connection failed - retrying...");
+      setTimeout(initializeAfterApproval, 3000);
     }
-    
-    await updateParticipants(meetingDbId);
-    setConnectionStatus("Connected to meeting");
-  } catch (error) {
-    console.error("Post-approval initialization error:", error);
-    setConnectionStatus("Connection failed - retrying...");
-    setTimeout(initializeAfterApproval, 3000);
-  }
-};
+  };
 
   const joinMeeting = useCallback(
     async (meetingId, userId) => {
@@ -1805,6 +1933,52 @@ const initializeAfterApproval = async () => {
     }
   }, [waitingForApproval, permitToJoin, meetingDbId, user?.id]);
 
+  // Add to your useEffect hooks
+  useEffect(() => {
+    if (!meetingDbId) return;
+
+    // Channel for participant updates
+    const participantChannel = supabase
+      .channel(`participant_updates:${meetingDbId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${meetingDbId}`,
+        },
+        (payload) => {
+          if (
+            payload.eventType === "UPDATE" ||
+            payload.eventType === "INSERT"
+          ) {
+            // Find all peer connections for this user
+            Object.entries(peerConnectionsRef.current).forEach(
+              ([peerId, conn]) => {
+                if (conn.peer === payload.new.user_id) {
+                  const displayName =
+                    payload.new.display_name || payload.new.email;
+
+                  if (displayName) {
+                    setParticipantNames((prev) => ({
+                      ...prev,
+                      [peerId]: displayName,
+                    }));
+                  }
+                }
+              }
+            );
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(participantChannel);
+    };
+  }, [meetingDbId]);
+
   if (needPasscode) {
     return (
       <div className="p-4 max-w-md mx-auto">
@@ -1974,24 +2148,32 @@ const initializeAfterApproval = async () => {
                 👥 Participants ({participants.length})
               </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
-                {participants.map((participant) => (
-                  <div
-                    key={participant.id}
-                    className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
-                  >
-                    <span className="text-sm truncate flex items-center">
-                      {participant.email}
-                      {participant.id === user?.id && (
-                        <span className="ml-2 text-xs text-gray-500">
-                          (You)
-                        </span>
+                {participants.map((participant) => {
+                  const displayName =
+                    participant.display_name ||
+                    participant.profiles?.name ||
+                    participant.email ||
+                    `User ${participant.user_id.slice(0, 4)}`;
+
+                  return (
+                    <div
+                      key={participant.user_id}
+                      className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
+                    >
+                      <span className="text-sm truncate flex items-center">
+                        {displayName}
+                        {participant.user_id === user?.id && (
+                          <span className="ml-2 text-xs text-gray-500">
+                            (You)
+                          </span>
+                        )}
+                      </span>
+                      {activeSpeakers[participant.user_id] && (
+                        <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
                       )}
-                    </span>
-                    {activeSpeakers[participant.id] && (
-                      <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
-                    )}
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -2047,38 +2229,50 @@ const initializeAfterApproval = async () => {
           )}
 
           {waitingForApproval && (
-  <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-    <div className="flex items-center gap-3">
-      <div className="animate-spin text-blue-500">
-        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-        </svg>
-      </div>
-      <div>
-        <h3 className="font-medium text-blue-800">Waiting for host approval</h3>
-        <p className="text-sm text-blue-600">
-          {approvalCheckCount > 0 
-            ? `Still waiting... (checked ${approvalCheckCount} times)`
-            : "Your request has been sent to the host"}
-        </p>
-        <div className="mt-2 flex gap-2">
-          <button
-            onClick={() => window.location.reload()}
-            className="text-sm bg-blue-100 text-blue-800 px-3 py-1 rounded hover:bg-blue-200"
-          >
-            Refresh Status
-          </button>
-          <button
-            onClick={() => navigate("/")}
-            className="text-sm bg-gray-100 text-gray-800 px-3 py-1 rounded hover:bg-gray-200"
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
-)}
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <div className="flex items-center gap-3">
+                <div className="animate-spin text-blue-500">
+                  <svg
+                    className="w-6 h-6"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="font-medium text-blue-800">
+                    Waiting for host approval
+                  </h3>
+                  <p className="text-sm text-blue-600">
+                    {approvalCheckCount > 0
+                      ? `Still waiting... (checked ${approvalCheckCount} times)`
+                      : "Your request has been sent to the host"}
+                  </p>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      onClick={() => window.location.reload()}
+                      className="text-sm bg-blue-100 text-blue-800 px-3 py-1 rounded hover:bg-blue-200"
+                    >
+                      Refresh Status
+                    </button>
+                    <button
+                      onClick={() => navigate("/")}
+                      className="text-sm bg-gray-100 text-gray-800 px-3 py-1 rounded hover:bg-gray-200"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
           <div
             className={`bg-white border rounded-lg ${
               showChat ? "block" : "hidden"
