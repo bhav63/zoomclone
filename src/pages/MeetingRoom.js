@@ -311,34 +311,32 @@ export default function MeetingRoom() {
     [roomId, user?.id]
   );
 
-  const updateParticipants = async (meetingId) => {
-    try {
-      const { data, error } = await supabase
-        .from("participants")
-        .select(
-          `
-        user_id,
-        email,
-        status,
-        created_at
-      `
-        )
-        .eq("meeting_id", meetingId)
-        .eq("status", "approved");
+ const updateParticipants = async (meetingId) => {
+  const { data } = await supabase
+    .from('participants')
+    .select('user_id, email')
+    .eq('meeting_id', meetingId)
+    .eq('status', 'approved');
 
-      if (error) throw error;
-
-      const formattedParticipants = data.map((p) => ({
-        id: p.user_id,
-        user_id: p.user_id,
-        email: p.email,
-      }));
-
-      setParticipants(formattedParticipants);
-    } catch (error) {
-      console.error("Error updating participants:", error);
-    }
-  };
+  if (data) {
+    setParticipants(data);
+    
+    // Update names mapping
+    const names = {};
+    data.forEach(p => {
+      if (p.email) {
+        // Find the peer ID for this user
+        const peerId = Object.entries(peerConnectionsRef.current)
+          .find(([_, conn]) => conn.peer === p.user_id)?.[0];
+        
+        if (peerId) {
+          names[peerId] = p.email;
+        }
+      }
+    });
+    setParticipantNames(names);
+  }
+};
 
   const updateWaitingList = async (meetingId) => {
     try {
@@ -924,6 +922,8 @@ export default function MeetingRoom() {
     label.className =
       "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
     label.textContent = participantNames[id] || id;
+    label.style.transition = 'opacity 0.3s';  // Add transition for smooth animation
+    label.style.opacity = '1';  // Start visible
 
     const speakingIndicator = document.createElement("div");
     speakingIndicator.className =
@@ -943,6 +943,20 @@ export default function MeetingRoom() {
 
     const container = document.getElementById("remote-videos");
     if (container) container.appendChild(div);
+
+    // Function to update name when it changes
+    const updateName = () => {
+      if (!isMountedRef.current) return;
+      
+      if (participantNames[id] && label.textContent !== participantNames[id]) {
+        label.style.opacity = '0';
+        setTimeout(() => {
+          label.textContent = participantNames[id];
+          label.style.opacity = '1';
+        }, 300);
+      }
+      requestAnimationFrame(updateName);
+    };
 
     const updateUIElements = () => {
       if (!isMountedRef.current) return;
@@ -965,8 +979,10 @@ export default function MeetingRoom() {
       requestAnimationFrame(updateUIElements);
     };
 
+    // Start both update loops
+    updateName();
     updateUIElements();
-  };
+};
 
   const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
@@ -2029,7 +2045,7 @@ const initializeAfterApproval = async () => {
               )}
             </div>
           )}
-          
+
           {waitingForApproval && (
   <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
     <div className="flex items-center gap-3">
