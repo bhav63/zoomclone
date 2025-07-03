@@ -316,10 +316,10 @@ export default function MeetingRoom() {
 
 const updateParticipants = async (meetingId) => {
   try {
-    // Get all participants with their emails
+    // Get all approved participants with their user_ids
     const { data: participantsData, error: participantsError } = await supabase
       .from('participants')
-      .select('user_id, email')
+      .select('user_id, status, email, display_name')
       .eq('meeting_id', meetingId)
       .eq('status', 'approved');
 
@@ -336,10 +336,38 @@ const updateParticipants = async (meetingId) => {
     if (participantsData && signalsData) {
       setParticipants(participantsData);
 
-      // Create mapping of user_id to email
-      const userToEmailMap = {};
+      // Get unique user IDs from participants and signals
+      const participantUserIds = participantsData.map(p => p.user_id);
+      const signalUserIds = signalsData.map(s => s.user_id);
+      const allUserIds = [...new Set([...participantUserIds, ...signalUserIds])];
+
+      // Fetch profile data for all users who might be missing emails
+      const { data: profilesData, error: profilesError } = await supabase
+        .from('profiles')
+        .select('id, email, name')
+        .in('id', allUserIds);
+
+      if (profilesError) throw profilesError;
+
+      // Create mapping of user_id to display info
+      const userInfoMap = {};
+      
+      // First use participant data (which may have display_name)
       participantsData.forEach(p => {
-        userToEmailMap[p.user_id] = p.email;
+        userInfoMap[p.user_id] = {
+          email: p.email || null,
+          displayName: p.display_name || null
+        };
+      });
+
+      // Then supplement with profile data where needed
+      profilesData.forEach(profile => {
+        if (!userInfoMap[profile.id] || !userInfoMap[profile.id].email) {
+          userInfoMap[profile.id] = {
+            email: profile.email || null,
+            displayName: profile.name || null
+          };
+        }
       });
 
       // Create mapping of peer_id to user_id
@@ -349,14 +377,30 @@ const updateParticipants = async (meetingId) => {
       });
       setPeerToUserIdMap(newPeerToUserIdMap);
 
-      // Create mapping of peer_id to email
+      // Create mapping of peer_id to display info
       const newParticipantNames = {};
       signalsData.forEach(s => {
-        if (userToEmailMap[s.user_id]) {
-          newParticipantNames[s.peer_id] = userToEmailMap[s.user_id];
+        const userInfo = userInfoMap[s.user_id];
+        if (userInfo) {
+          // Prefer display_name from participants, then name from profiles, then email
+          newParticipantNames[s.peer_id] = 
+            userInfo.displayName || 
+            userInfo.email || 
+            `User ${s.user_id.slice(0, 4)}`;
         }
       });
       setParticipantNames(newParticipantNames);
+
+      // Update any existing remote video labels
+      Object.keys(remoteVideosRef.current).forEach(peerId => {
+        const videoDiv = remoteVideosRef.current[peerId];
+        if (videoDiv) {
+          const label = videoDiv.querySelector('.participant-label');
+          if (label && newParticipantNames[peerId]) {
+            label.textContent = newParticipantNames[peerId];
+          }
+        }
+      });
     }
   } catch (error) {
     console.error("Error updating participants:", error);
@@ -919,7 +963,7 @@ const updateParticipants = async (meetingId) => {
     }, 5000);
   };
 
- const addRemote = (id, stream) => {
+const addRemote = (id, stream) => {
   if (remoteVideosRef.current[id]) return;
 
   const div = document.createElement("div");
@@ -932,13 +976,13 @@ const updateParticipants = async (meetingId) => {
   vid.playsInline = true;
   vid.className = "w-full h-full object-cover";
 
-  // Only create label if we have an email for this participant
-  const participantEmail = participantNames[id];
-  if (participantEmail) {
+  // Get display info for this participant
+  const displayInfo = participantNames[id];
+  if (displayInfo) {
     const label = document.createElement("div");
     label.className = 
       "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
-    label.textContent = participantEmail;
+    label.textContent = displayInfo;
     div.appendChild(label);
   }
 
@@ -960,8 +1004,7 @@ const updateParticipants = async (meetingId) => {
   const updateLabel = () => {
     if (!isMountedRef.current) return;
     
-    // Only update if we have a label element
-    if (participantEmail) {
+    if (displayInfo) {
       const currentLabel = div.querySelector('.participant-label');
       if (currentLabel) {
         currentLabel.textContent = participantNames[id] || `User ${id.slice(-4)}`;
@@ -980,7 +1023,6 @@ const updateParticipants = async (meetingId) => {
   
   updateLabel();
 };
-
   const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
     if (el) {
