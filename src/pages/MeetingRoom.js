@@ -1294,19 +1294,54 @@ export default function MeetingRoom() {
 
   const approveUser = async (uid) => {
   try {
-    // Get the user's email from auth.users table (more reliable than profiles)
-    const { data: authUser } = await supabase.auth.admin.getUserById(uid);
-    const userEmail = authUser.user.email;
+    // First, check if the participant already exists with an email
+    const { data: existingParticipant, error: fetchError } = await supabase
+      .from("participants")
+      .select("email")
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", uid)
+      .single();
 
+    let userEmail = existingParticipant?.email;
+
+    // If we don't have the email, try to get it from the public profiles table
+    if (!userEmail) {
+      const { data: profile, error: profileError } = await supabase
+        .from("profiles")
+        .select("email")
+        .eq("id", uid)
+        .single();
+
+      if (profileError) throw profileError;
+      userEmail = profile?.email;
+    }
+
+    // If we still don't have the email, get it from the auth session
+    if (!userEmail) {
+      const { data: { user: authUser } } = await supabase.auth.getUser();
+      if (authUser?.id === uid) {
+        userEmail = authUser.email;
+      }
+    }
+
+    // If we still don't have an email, use a placeholder
+    if (!userEmail) {
+      userEmail = `user-${uid.slice(0, 8)}@unknown.com`;
+      console.warn(`Could not find email for user ${uid}, using placeholder`);
+    }
+
+    // Update the participant status
     const { error: updateError } = await supabase
       .from("participants")
-      .update({
+      .upsert({
+        meeting_id: meetingDbId,
+        user_id: uid,
         status: "approved",
-        email: userEmail, // Store the email in participants table
+        email: userEmail,
         updated_at: new Date().toISOString(),
-      })
-      .eq("meeting_id", meetingDbId)
-      .eq("user_id", uid);
+      }, {
+        onConflict: "meeting_id,user_id"
+      });
 
     if (updateError) throw updateError;
 
@@ -1318,12 +1353,20 @@ export default function MeetingRoom() {
         event: "approved",
         payload: { userId: uid },
       });
+
+    // Update the waiting list immediately
+    await updateWaitingList(meetingDbId);
+
   } catch (error) {
     console.error("Error approving user:", error);
-    alert("Failed to approve user. Please try again.");
+    // Show a more specific error message
+    if (error.message.includes("permission denied")) {
+      alert("You don't have permission to approve users.");
+    } else {
+      alert("Failed to approve user. Please try again.");
+    }
   }
 };
-
   const denyUser = async (uid) => {
     try {
       const { error } = await supabase
