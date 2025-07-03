@@ -313,51 +313,46 @@ export default function MeetingRoom() {
   );
 
   const updateParticipants = async (meetingId) => {
-    try {
-      const { data, error } = await supabase
-        .from("participants")
-        .select(
-          `
+  try {
+    const { data, error } = await supabase
+      .from("participants")
+      .select(`
         user_id, 
         email,
-        display_name,
-        profiles(name, avatar_url)
-      `
-        )
-        .eq("meeting_id", meetingId)
-        .eq("status", "approved");
+        display_name
+      `)
+      .eq("meeting_id", meetingId)
+      .eq("status", "approved");
 
-      if (error) throw error;
+    if (error) throw error;
 
-      // Update participants list
-      setParticipants(data || []);
+    // Update participants list
+    setParticipants(data || []);
 
-      // Create mapping of user_id to participant data
-      const userDataMap = {};
-      data?.forEach((p) => {
-        userDataMap[p.user_id] = {
-          email: p.email,
-          name: p.display_name || p.profiles?.name,
-          avatar: p.profiles?.avatar_url,
-        };
-      });
+    // Create mapping of user_id to participant data
+    const userDataMap = {};
+    data?.forEach((p) => {
+      userDataMap[p.user_id] = {
+        email: p.email,
+        name: p.display_name || p.email,
+      };
+    });
 
-      // Update participantNames by finding peer IDs for each user
-      const newNames = { ...participantNames };
-      Object.entries(peerConnectionsRef.current).forEach(([peerId, conn]) => {
-        const userId = conn.peer; // Assuming peer connection has user ID
-        if (userDataMap[userId]) {
-          newNames[peerId] =
-            userDataMap[userId].name || userDataMap[userId].email;
-        }
-      });
+    // Update participantNames by finding peer IDs for each user
+    const newNames = { ...participantNames };
+    Object.entries(peerConnectionsRef.current).forEach(([peerId, conn]) => {
+      const userId = conn.peer; // Assuming peer connection has user ID
+      if (userDataMap[userId]) {
+        newNames[peerId] = userDataMap[userId].name || userDataMap[userId].email;
+      }
+    });
 
-      setParticipantNames(newNames);
-      setParticipantData(userDataMap);
-    } catch (error) {
-      console.error("Error updating participants:", error);
-    }
-  };
+    setParticipantNames(newNames);
+    setParticipantData(userDataMap);
+  } catch (error) {
+    console.error("Error updating participants:", error);
+  }
+};
 
   const updateWaitingList = async (meetingId) => {
     try {
@@ -1298,32 +1293,36 @@ export default function MeetingRoom() {
   };
 
   const approveUser = async (uid) => {
-    try {
-      // First get the user's email from profiles
-      const { data: userProfile } = await supabase
-        .from("profiles")
-        .select("email")
-        .eq("id", uid)
-        .single();
+  try {
+    // Get the user's email from auth.users table (more reliable than profiles)
+    const { data: authUser } = await supabase.auth.admin.getUserById(uid);
+    const userEmail = authUser.user.email;
 
-      const { error: updateError } = await supabase
-        .from("participants")
-        .update({
-          status: "approved",
-          email: userProfile?.email, // Store the email in participants table
-          updated_at: new Date().toISOString(),
-        })
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", uid);
+    const { error: updateError } = await supabase
+      .from("participants")
+      .update({
+        status: "approved",
+        email: userEmail, // Store the email in participants table
+        updated_at: new Date().toISOString(),
+      })
+      .eq("meeting_id", meetingDbId)
+      .eq("user_id", uid);
 
-      if (updateError) throw updateError;
+    if (updateError) throw updateError;
 
-      // Rest of the approval logic...
-    } catch (error) {
-      console.error("Error approving user:", error);
-      alert("Failed to approve user. Please try again.");
-    }
-  };
+    // Send real-time update
+    await supabase
+      .channel(`approval:${uid}`)
+      .send({
+        type: "broadcast",
+        event: "approved",
+        payload: { userId: uid },
+      });
+  } catch (error) {
+    console.error("Error approving user:", error);
+    alert("Failed to approve user. Please try again.");
+  }
+};
 
   const denyUser = async (uid) => {
     try {
