@@ -312,43 +312,33 @@ export default function MeetingRoom() {
     [roomId, user?.id]
   );
 
-  const updateParticipants = async (meetingId) => {
+ const updateParticipants = async (meetingId) => {
   try {
     const { data, error } = await supabase
       .from("participants")
       .select(`
         user_id, 
         email,
-        display_name
+        display_name,
+        profiles(name)
       `)
       .eq("meeting_id", meetingId)
       .eq("status", "approved");
 
     if (error) throw error;
 
-    // Update participants list
+    // Update both participants list and participant data
     setParticipants(data || []);
-
-    // Create mapping of user_id to participant data
-    const userDataMap = {};
-    data?.forEach((p) => {
-      userDataMap[p.user_id] = {
+    
+    const newData = {};
+    data?.forEach(p => {
+      newData[p.user_id] = {
+        userId: p.user_id,
         email: p.email,
-        name: p.display_name || p.email,
+        name: p.display_name || p.profiles?.name || p.email
       };
     });
-
-    // Update participantNames by finding peer IDs for each user
-    const newNames = { ...participantNames };
-    Object.entries(peerConnectionsRef.current).forEach(([peerId, conn]) => {
-      const userId = conn.peer; // Assuming peer connection has user ID
-      if (userDataMap[userId]) {
-        newNames[peerId] = userDataMap[userId].name || userDataMap[userId].email;
-      }
-    });
-
-    setParticipantNames(newNames);
-    setParticipantData(userDataMap);
+    setParticipantData(newData);
   } catch (error) {
     console.error("Error updating participants:", error);
   }
@@ -1028,84 +1018,48 @@ export default function MeetingRoom() {
     }, 5000);
   };
 
-  const addRemote = (id, stream) => {
-    if (remoteVideosRef.current[id]) return;
+ const addRemote = (id, stream) => {
+  if (remoteVideosRef.current[id]) return;
 
-    const div = document.createElement("div");
-    div.className = "relative bg-black rounded-lg overflow-hidden";
-    div.id = `remote-${id}`;
+  const div = document.createElement("div");
+  div.className = "relative bg-black rounded-lg overflow-hidden";
+  div.id = `remote-${id}`;
 
-    const vid = document.createElement("video");
-    vid.srcObject = stream;
-    vid.autoplay = true;
-    vid.playsInline = true;
-    vid.className = "w-full h-full object-cover";
+  const vid = document.createElement("video");
+  vid.srcObject = stream;
+  vid.autoplay = true;
+  vid.playsInline = true;
+  vid.className = "w-full h-full object-cover";
 
-    // Audio context setup
-    if (!audioContextRef.current) {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      audioContextRef.current = new AudioContext();
-    }
+  // Create participant label with email
+  const label = document.createElement("div");
+  label.className = 
+    "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
+  
+  // Get the participant data for this connection
+  const participant = participantData[id] || 
+                    participants.find(p => p.user_id === id) || 
+                    { email: `User ${id.slice(-4)}` };
+  
+  // Use email if available, otherwise fallback
+  label.textContent = participant.email || participant.name || `User ${id.slice(-4)}`;
 
-    const analyser = audioContextRef.current.createAnalyser();
-    analyser.fftSize = 512;
-    const source = audioContextRef.current.createMediaStreamSource(stream);
-    source.connect(analyser);
-    analysersRef.current[id] = analyser;
+  // Speaking indicator
+  const speakingIndicator = document.createElement("div");
+  speakingIndicator.className = 
+    "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
+  speakingIndicator.id = `speaking-${id}`;
 
-    // Create participant label with smooth transitions
-    const label = document.createElement("div");
-    label.className =
-      "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
-    label.textContent = participantNames[id] || `Participant ${id.slice(-4)}`;
-    label.style.transition = "opacity 0.3s";
-    label.style.opacity = "1";
+  // Add elements to DOM
+  div.appendChild(vid);
+  div.appendChild(label);
+  div.appendChild(speakingIndicator);
+  remoteVideosRef.current[id] = div;
 
-    // Other UI elements
-    const speakingIndicator = document.createElement("div");
-    speakingIndicator.className =
-      "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
-    speakingIndicator.id = `speaking-${id}`;
+  const container = document.getElementById("remote-videos");
+  if (container) container.appendChild(div);
+};
 
-    const statsElement = document.createElement("div");
-    statsElement.className =
-      "absolute top-2 left-2 bg-black bg-opacity-50 text-white text-xs px-1 rounded";
-    statsElement.id = `stats-${id}`;
-
-    // Add elements to DOM
-    div.appendChild(vid);
-    div.appendChild(label);
-    div.appendChild(speakingIndicator);
-    div.appendChild(statsElement);
-    remoteVideosRef.current[id] = div;
-
-    const container = document.getElementById("remote-videos");
-    if (container) container.appendChild(div);
-
-    // Function to update name when participantNames changes
-    const updateName = () => {
-      if (!isMountedRef.current) return;
-
-      const currentLabel = document.querySelector(
-        `#remote-${id} .participant-label`
-      );
-      if (
-        currentLabel &&
-        participantNames[id] &&
-        currentLabel.textContent !== participantNames[id]
-      ) {
-        currentLabel.style.opacity = "0";
-        setTimeout(() => {
-          currentLabel.textContent = participantNames[id];
-          currentLabel.style.opacity = "1";
-        }, 300);
-      }
-      requestAnimationFrame(updateName);
-    };
-
-    // Start the update loop
-    updateName();
-  };
 
   const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
