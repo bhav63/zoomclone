@@ -145,44 +145,6 @@ export default function MeetingRoom() {
   }, [permitToJoin, refreshMeetingState]);
 
   useEffect(() => {
-  const handleVisibilityChange = () => {
-    if (document.hidden) {
-      // Reduce refresh rate when tab is inactive
-      clearInterval(autoRefreshIntervalRef.current);
-      autoRefreshIntervalRef.current = setInterval(refreshMeetingState, 5000);
-    } else {
-      // Restore normal refresh rate
-      clearInterval(autoRefreshIntervalRef.current);
-      autoRefreshIntervalRef.current = setInterval(refreshMeetingState, AUTO_REFRESH_INTERVAL);
-    }
-  };
-
-  document.addEventListener('visibilitychange', handleVisibilityChange);
-  return () => {
-    document.removeEventListener('visibilitychange', handleVisibilityChange);
-  };
-}, [refreshMeetingState]);
-
-useEffect(() => {
-  const handleOnline = () => {
-    setConnectionStatus('Reconnecting...');
-    reconnectPeers();
-  };
-  
-  const handleOffline = () => {
-    setConnectionStatus('Offline - Waiting for connection');
-  };
-
-  window.addEventListener('online', handleOnline);
-  window.addEventListener('offline', handleOffline);
-  
-  return () => {
-    window.removeEventListener('online', handleOnline);
-    window.removeEventListener('offline', handleOffline);
-  };
-}, []);
-
-  useEffect(() => {
     const checkIfMobile = () => {
       setIsMobile(
         /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
@@ -277,6 +239,7 @@ useEffect(() => {
     }
   }, []);
 
+  // In setupParticipantListener
   const setupParticipantListener = useCallback(
     (mtId, uid) => {
       if (!participantListener.current) {
@@ -294,42 +257,58 @@ useEffect(() => {
               if (payload.new.status === "approved") {
                 setWaitingForApproval(false);
                 setPermitToJoin(true);
+
                 try {
-                  await requestMediaPermissions();
-                  await joinMeeting(mtId, uid);
-
-                  if (peerRef.current?.id) {
-                    const { data: others } = await supabase
-                      .from("signals")
-                      .select("peer_id, user_id")
-                      .eq("room_id", roomId)
-                      .neq("peer_id", peerRef.current.id);
-
-                    if (others?.length > 0) {
-                      await Promise.all(
-                        others.map(({ peer_id }) => connectToPeer(peer_id))
-                      );
-
-                      await supabase
-                        .from("signals")
-                        .update({ last_active: new Date().toISOString() })
-                        .eq("room_id", roomId)
-                        .eq("peer_id", peerRef.current.id);
-                    }
+                  // Initialize media and peer connection if not already done
+                  if (!localStreamRef.current) {
+                    await requestMediaPermissions();
                   }
-                } catch (err) {
-                  console.error("Error joining after approval:", err);
+
+                  if (!peerRef.current) {
+                    const peer = createPeer(user.id);
+                    peerRef.current = peer;
+
+                    peer.on("open", async (id) => {
+                      await supabase.from("signals").upsert({
+                        room_id: roomId,
+                        peer_id: id,
+                        user_id: user.id,
+                        last_active: new Date().toISOString(),
+                      });
+
+                      // Connect to existing participants
+                      const { data: others } = await supabase
+                        .from("signals")
+                        .select("peer_id")
+                        .eq("room_id", roomId)
+                        .neq("peer_id", id);
+
+                      if (others?.length > 0) {
+                        others.forEach(({ peer_id }) => connectToPeer(peer_id));
+                      }
+                    });
+
+                    peer.on("call", (call) => {
+                      call.answer(localStreamRef.current);
+                      setupCall(call, call.peer);
+                    });
+                  }
+
+                  // Force refresh of participants list
+                  await updateParticipants(mtId);
+                  setConnectionStatus("Connected to meeting");
+                } catch (error) {
+                  console.error("Approval handling error:", error);
+                  setConnectionStatus("Connection failed - retrying...");
+                  setTimeout(() => setupParticipantListener(mtId, uid), 3000);
                 }
-              } else if (payload.new.status === "denied") {
-                setWaitingForApproval(false);
-                navigate("/");
               }
             }
           )
           .subscribe();
       }
     },
-    [navigate, roomId]
+    [roomId, user?.id]
   );
 
   const updateParticipants = async (meetingId) => {
@@ -352,7 +331,7 @@ useEffect(() => {
       const formattedParticipants = data.map((p) => ({
         id: p.user_id,
         user_id: p.user_id,
-        email: p.email , 
+        email: p.email,
       }));
 
       setParticipants(formattedParticipants);
@@ -1032,8 +1011,6 @@ useEffect(() => {
           .subscribe();
       }
 
-      
-
       const { data: oldReacts } = await supabase
         .from("reactions")
         .select("*")
@@ -1328,6 +1305,112 @@ useEffect(() => {
     }
   };
 
+  // Add this state
+const [approvalCheckCount, setApprovalCheckCount] = useState(0);
+
+// Enhanced approval handling
+useEffect(() => {
+  if (!waitingForApproval || !meetingDbId || !user?.id) return;
+
+  // Real-time listener (primary method)
+  const listener = supabase
+    .channel(`approval:${meetingDbId}:${user.id}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "UPDATE",
+        schema: "public",
+        table: "participants",
+        filter: `meeting_id=eq.${meetingDbId},user_id=eq.${user.id}`,
+      },
+      (payload) => {
+        if (payload.new.status === "approved") {
+          handleApproval();
+        }
+      }
+    )
+    .subscribe();
+
+  // Polling fallback
+  const interval = setInterval(async () => {
+    try {
+      const { data } = await supabase
+        .from("participants")
+        .select("status")
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", user.id)
+        .single();
+
+      if (data?.status === "approved") {
+        handleApproval();
+        clearInterval(interval);
+      } else {
+        setApprovalCheckCount(prev => prev + 1);
+      }
+    } catch (error) {
+      console.error("Approval check error:", error);
+    }
+  }, 10000); // Check every 10 seconds
+
+  const handleApproval = () => {
+    setWaitingForApproval(false);
+    setPermitToJoin(true);
+    clearInterval(interval);
+    supabase.removeChannel(listener);
+    
+    // Initialize meeting connection
+    initializeAfterApproval();
+  };
+
+  return () => {
+    clearInterval(interval);
+    supabase.removeChannel(listener);
+  };
+}, [waitingForApproval, meetingDbId, user?.id]);
+
+const initializeAfterApproval = async () => {
+  try {
+    await requestMediaPermissions();
+    
+    if (!peerRef.current) {
+      const peer = createPeer(user.id);
+      peerRef.current = peer;
+      
+      peer.on("open", async (id) => {
+        await supabase.from("signals").upsert({
+          room_id: roomId,
+          peer_id: id,
+          user_id: user.id,
+          last_active: new Date().toISOString(),
+        });
+        
+        // Connect to existing participants
+        const { data: others } = await supabase
+          .from("signals")
+          .select("peer_id")
+          .eq("room_id", roomId)
+          .neq("peer_id", id);
+          
+        if (others?.length > 0) {
+          others.forEach(({ peer_id }) => connectToPeer(peer_id));
+        }
+      });
+      
+      peer.on("call", (call) => {
+        call.answer(localStreamRef.current);
+        setupCall(call, call.peer);
+      });
+    }
+    
+    await updateParticipants(meetingDbId);
+    setConnectionStatus("Connected to meeting");
+  } catch (error) {
+    console.error("Post-approval initialization error:", error);
+    setConnectionStatus("Connection failed - retrying...");
+    setTimeout(initializeAfterApproval, 3000);
+  }
+};
+
   const joinMeeting = useCallback(
     async (meetingId, userId) => {
       if (isJoining) return;
@@ -1511,6 +1594,28 @@ useEffect(() => {
     }
   }, []);
 
+  // Add this function
+  const setupApprovalEventSource = useCallback((meetingId, userId) => {
+    const eventSource = new EventSource(
+      `/api/approval-events?meeting=${meetingId}&user=${userId}`
+    );
+
+    eventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.status === "approved") {
+        setWaitingForApproval(false);
+        setPermitToJoin(true);
+        eventSource.close();
+      }
+    };
+
+    eventSource.onerror = () => {
+      setTimeout(() => setupApprovalEventSource(meetingId, userId), 5000);
+    };
+
+    return () => eventSource.close();
+  }, []);
+
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
 
@@ -1634,20 +1739,6 @@ useEffect(() => {
     setInputPasscode(pass);
   }, [search]);
 
-useEffect(() => {
-  const refreshRate = isMobile ? 3000 : AUTO_REFRESH_INTERVAL;
-  if (autoRefreshIntervalRef.current) {
-    clearInterval(autoRefreshIntervalRef.current);
-  }
-  autoRefreshIntervalRef.current = setInterval(refreshMeetingState, refreshRate);
-  
-  return () => {
-    if (autoRefreshIntervalRef.current) {
-      clearInterval(autoRefreshIntervalRef.current);
-    }
-  };
-}, [isMobile, refreshMeetingState]);
-
   useEffect(() => {
     isMountedRef.current = true;
 
@@ -1670,6 +1761,33 @@ useEffect(() => {
       }
     };
   }, [needPasscode, initRoom, leaveRoom, isInitialized]);
+
+  // Add to your useEffect hooks
+  useEffect(() => {
+    if (waitingForApproval && !permitToJoin) {
+      const approvalCheckInterval = setInterval(async () => {
+        try {
+          const { data } = await supabase
+            .from("participants")
+            .select("status")
+            .eq("meeting_id", meetingDbId)
+            .eq("user_id", user?.id)
+            .single();
+
+          if (data?.status === "approved") {
+            setWaitingForApproval(false);
+            setPermitToJoin(true);
+            clearInterval(approvalCheckInterval);
+            window.location.reload(); // Last resort if other methods fail
+          }
+        } catch (error) {
+          console.error("Approval check error:", error);
+        }
+      }, 5000); // Check every 5 seconds
+
+      return () => clearInterval(approvalCheckInterval);
+    }
+  }, [waitingForApproval, permitToJoin, meetingDbId, user?.id]);
 
   if (needPasscode) {
     return (
@@ -1911,15 +2029,40 @@ useEffect(() => {
               )}
             </div>
           )}
+          
           {waitingForApproval && (
-            <div className="bg-yellow-100 border border-yellow-300 rounded-lg p-4">
-              <p className="text-yellow-800">
-                ⏳ Your request to join has been sent to the host. Please wait
-                for approval...
-              </p>
-            </div>
-          )}
-
+  <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+    <div className="flex items-center gap-3">
+      <div className="animate-spin text-blue-500">
+        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
+      </div>
+      <div>
+        <h3 className="font-medium text-blue-800">Waiting for host approval</h3>
+        <p className="text-sm text-blue-600">
+          {approvalCheckCount > 0 
+            ? `Still waiting... (checked ${approvalCheckCount} times)`
+            : "Your request has been sent to the host"}
+        </p>
+        <div className="mt-2 flex gap-2">
+          <button
+            onClick={() => window.location.reload()}
+            className="text-sm bg-blue-100 text-blue-800 px-3 py-1 rounded hover:bg-blue-200"
+          >
+            Refresh Status
+          </button>
+          <button
+            onClick={() => navigate("/")}
+            className="text-sm bg-gray-100 text-gray-800 px-3 py-1 rounded hover:bg-gray-200"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+)}
           <div
             className={`bg-white border rounded-lg ${
               showChat ? "block" : "hidden"
