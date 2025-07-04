@@ -1045,6 +1045,7 @@ export default function MeetingRoom() {
 
   const loadMessagesAndReactions = async () => {
     try {
+      // Load existing messages
       const { data: oldMsgs } = await supabase
         .from("messages")
         .select("*")
@@ -1052,6 +1053,15 @@ export default function MeetingRoom() {
         .order("created_at", { ascending: true });
       setMessages(oldMsgs || []);
 
+      // Load existing reactions
+      const { data: oldReacts } = await supabase
+        .from("reactions")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+      setReactions(oldReacts || []);
+
+      // Setup messages channel if not already set up
       if (!messagesChannel.current) {
         messagesChannel.current = supabase
           .channel(`messages:${roomId}`)
@@ -1064,20 +1074,26 @@ export default function MeetingRoom() {
               filter: `room_id=eq.${roomId}`,
             },
             (payload) => {
-              setMessages((prev) => [...prev, payload.new]);
+              // Check if message already exists to prevent duplicates
+              setMessages((prev) => {
+                const exists = prev.some((msg) => msg.id === payload.new.id);
+                return exists ? prev : [...prev, payload.new];
+              });
             }
           )
-          .subscribe();
+          .subscribe((status, err) => {
+            if (err) {
+              console.error("Messages channel error:", err);
+              setTimeout(() => {
+                if (messagesChannel.current) {
+                  messagesChannel.current.subscribe();
+                }
+              }, 2000);
+            }
+          });
       }
 
-      const { data: oldReacts } = await supabase
-        .from("reactions")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-
-      setReactions(oldReacts || []);
-
+      // Setup reactions channel if not already set up
       if (!reactionsChannel.current) {
         reactionsChannel.current = supabase
           .channel(`reactions:${roomId}`)
@@ -1092,7 +1108,12 @@ export default function MeetingRoom() {
             (payload) => {
               try {
                 if (payload.eventType === "INSERT") {
-                  setReactions((prev) => [...prev, payload.new]);
+                  setReactions((prev) => {
+                    const exists = prev.some(
+                      (react) => react.id === payload.new.id
+                    );
+                    return exists ? prev : [...prev, payload.new];
+                  });
                 } else if (payload.eventType === "DELETE") {
                   setReactions((prev) =>
                     prev.filter((r) => r.id !== payload.old.id)
@@ -1105,6 +1126,7 @@ export default function MeetingRoom() {
           )
           .subscribe((status, err) => {
             if (err) {
+              console.error("Reactions channel error:", err);
               setTimeout(() => {
                 if (reactionsChannel.current) {
                   reactionsChannel.current.subscribe();
@@ -1130,6 +1152,7 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
+    // Optimistically update UI
     setMessages((prev) => [...prev, newMessage]);
     setChatInput("");
 
@@ -1142,6 +1165,7 @@ export default function MeetingRoom() {
       });
 
       if (error) {
+        // Rollback if error occurs
         setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
         throw error;
       }
@@ -1150,7 +1174,6 @@ export default function MeetingRoom() {
       alert("Failed to send message. Please try again.");
     }
   };
-
   const sendReaction = async (emoji) => {
     if (!user?.id || !roomId) return;
     if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
@@ -1164,15 +1187,18 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
+    // Optimistically update UI
     setReactions((prev) => [...prev, newReaction]);
 
     try {
+      // Ensure user profile exists
       const { error: profileError } = await supabase
         .from("profiles")
         .upsert({ id: user.id, email: user.email }, { onConflict: "id" });
 
       if (profileError) throw profileError;
 
+      // Insert reaction
       const { error } = await supabase.from("reactions").insert({
         room_id: roomId,
         user_id: user.id,
@@ -1181,10 +1207,12 @@ export default function MeetingRoom() {
       });
 
       if (error) {
+        // Rollback if error occurs
         setReactions((prev) => prev.filter((r) => r.id !== tempId));
         throw error;
       }
 
+      // Add system message about reaction
       const { error: messageError } = await supabase.from("messages").insert({
         room_id: roomId,
         sender: "System",
@@ -1193,15 +1221,6 @@ export default function MeetingRoom() {
       });
 
       if (messageError) throw messageError;
-
-      const newSystemMessage = {
-        id: `sys-${Date.now()}`,
-        room_id: roomId,
-        sender: "System",
-        text: `${user.email} reacted with ${emoji}`,
-        created_at: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev, newSystemMessage]);
     } catch (error) {
       console.error("Error sending reaction:", error);
       if (error.code === "23503") {
@@ -1211,7 +1230,6 @@ export default function MeetingRoom() {
       }
     }
   };
-
   const approveUser = async (uid) => {
     try {
       // First get the user's email from profiles
@@ -1848,6 +1866,16 @@ export default function MeetingRoom() {
     }
   }, [waitingForApproval, permitToJoin, meetingDbId, user?.id]);
 
+  useEffect(() => {
+    if (permitToJoin && roomId) {
+      loadMessagesAndReactions();
+    }
+
+    return () => {
+      cleanupSubscriptions();
+    };
+  }, [permitToJoin, roomId]);
+
   if (needPasscode) {
     return (
       <div className="p-4 max-w-md mx-auto">
@@ -2148,7 +2176,15 @@ export default function MeetingRoom() {
                 ×
               </button>
             </div>
-            <div className="p-3 h-60 overflow-y-auto space-y-2">
+            <div
+              className="p-3 h-60 overflow-y-auto space-y-2"
+              ref={(el) => {
+                if (el) {
+                  // Auto-scroll to bottom when new messages arrive
+                  el.scrollTop = el.scrollHeight;
+                }
+              }}
+            >
               {messages.map((msg) => (
                 <div key={msg.id} className="text-sm">
                   <span className="font-semibold">{msg.sender}: </span>
