@@ -23,7 +23,9 @@ export default function MeetingRoom() {
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
+
   const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
+
   const [participants, setParticipants] = useState([]);
   const [permitToJoin, setPermitToJoin] = useState(false);
   const [meetingDbId, setMeetingDbId] = useState(null);
@@ -52,7 +54,6 @@ export default function MeetingRoom() {
     isReconnecting: false,
     attempts: 0,
   });
-  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
 
   const peerRef = useRef();
   const localStreamRef = useRef();
@@ -67,6 +68,7 @@ export default function MeetingRoom() {
   const analysersRef = useRef({});
   const peerConnectionsRef = useRef({});
   const statsIntervalRef = useRef();
+
   const recordingTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
   const pendingPeerConnections = useRef(new Set());
@@ -159,7 +161,8 @@ export default function MeetingRoom() {
   useEffect(() => {
     if (!meetingDbId || !isHost) return;
 
-    const listener = supabase
+    // Set up real-time listener for participant changes
+    const participantListener = supabase
       .channel(`participant_changes:${meetingDbId}`)
       .on(
         "postgres_changes",
@@ -177,7 +180,7 @@ export default function MeetingRoom() {
       .subscribe();
 
     return () => {
-      supabase.removeChannel(listener);
+      supabase.removeChannel(participantListener);
     };
   }, [meetingDbId, isHost]);
 
@@ -239,6 +242,7 @@ export default function MeetingRoom() {
     }
   }, []);
 
+  // In setupParticipantListener
   const setupParticipantListener = useCallback(
     (mtId, uid) => {
       if (!participantListener.current) {
@@ -258,6 +262,7 @@ export default function MeetingRoom() {
                 setPermitToJoin(true);
 
                 try {
+                  // Initialize media and peer connection if not already done
                   if (!localStreamRef.current) {
                     await requestMediaPermissions();
                   }
@@ -274,6 +279,7 @@ export default function MeetingRoom() {
                         last_active: new Date().toISOString(),
                       });
 
+                      // Connect to existing participants
                       const { data: others } = await supabase
                         .from("signals")
                         .select("peer_id")
@@ -291,6 +297,7 @@ export default function MeetingRoom() {
                     });
                   }
 
+                  // Force refresh of participants list
                   await updateParticipants(mtId);
                   setConnectionStatus("Connected to meeting");
                 } catch (error) {
@@ -309,75 +316,89 @@ export default function MeetingRoom() {
 
   const updateParticipants = async (meetingId) => {
     try {
-      const { data: participantsData, error: participantsError } = await supabase
-        .from('participants')
-        .select('user_id, status, email, display_name')
-        .eq('meeting_id', meetingId)
-        .eq('status', 'approved');
+      // Get all approved participants with their user_ids
+      const { data: participantsData, error: participantsError } =
+        await supabase
+          .from("participants")
+          .select("user_id, status, email, display_name")
+          .eq("meeting_id", meetingId)
+          .eq("status", "approved");
 
       if (participantsError) throw participantsError;
 
+      // Get all active signals (peer connections)
       const { data: signalsData, error: signalsError } = await supabase
-        .from('signals')
-        .select('peer_id, user_id')
-        .eq('room_id', roomId);
+        .from("signals")
+        .select("peer_id, user_id")
+        .eq("room_id", roomId);
 
       if (signalsError) throw signalsError;
 
       if (participantsData && signalsData) {
         setParticipants(participantsData);
 
-        const participantUserIds = participantsData.map(p => p.user_id);
-        const signalUserIds = signalsData.map(s => s.user_id);
-        const allUserIds = [...new Set([...participantUserIds, ...signalUserIds])];
+        // Get unique user IDs from participants and signals
+        const participantUserIds = participantsData.map((p) => p.user_id);
+        const signalUserIds = signalsData.map((s) => s.user_id);
+        const allUserIds = [
+          ...new Set([...participantUserIds, ...signalUserIds]),
+        ];
 
+        // Fetch profile data for all users who might be missing emails
         const { data: profilesData, error: profilesError } = await supabase
-          .from('profiles')
-          .select('id, email, name')
-          .in('id', allUserIds);
+          .from("profiles")
+          .select("id, email, name")
+          .in("id", allUserIds);
 
         if (profilesError) throw profilesError;
 
+        // Create mapping of user_id to display info
         const userInfoMap = {};
-        
-        participantsData.forEach(p => {
+
+        // First use participant data (which may have display_name)
+        participantsData.forEach((p) => {
           userInfoMap[p.user_id] = {
             email: p.email || null,
-            displayName: p.display_name || null
+            displayName: p.display_name || null,
           };
         });
 
-        profilesData.forEach(profile => {
+        // Then supplement with profile data where needed
+        profilesData.forEach((profile) => {
           if (!userInfoMap[profile.id] || !userInfoMap[profile.id].email) {
             userInfoMap[profile.id] = {
               email: profile.email || null,
-              displayName: profile.name || null
+              displayName: profile.name || null,
             };
           }
         });
 
+        // Create mapping of peer_id to user_id
         const newPeerToUserIdMap = {};
-        signalsData.forEach(s => {
+        signalsData.forEach((s) => {
           newPeerToUserIdMap[s.peer_id] = s.user_id;
         });
         setPeerToUserIdMap(newPeerToUserIdMap);
 
+        // Create mapping of peer_id to display info
         const newParticipantNames = {};
-        signalsData.forEach(s => {
+        signalsData.forEach((s) => {
           const userInfo = userInfoMap[s.user_id];
           if (userInfo) {
-            newParticipantNames[s.peer_id] = 
-              userInfo.displayName || 
-              userInfo.email || 
+            // Prefer display_name from participants, then name from profiles, then email
+            newParticipantNames[s.peer_id] =
+              userInfo.displayName ||
+              userInfo.email ||
               `User ${s.user_id.slice(0, 4)}`;
           }
         });
         setParticipantNames(newParticipantNames);
 
-        Object.keys(remoteVideosRef.current).forEach(peerId => {
+        // Update any existing remote video labels
+        Object.keys(remoteVideosRef.current).forEach((peerId) => {
           const videoDiv = remoteVideosRef.current[peerId];
           if (videoDiv) {
-            const label = videoDiv.querySelector('.participant-label');
+            const label = videoDiv.querySelector(".participant-label");
             if (label && newParticipantNames[peerId]) {
               label.textContent = newParticipantNames[peerId];
             }
@@ -391,6 +412,7 @@ export default function MeetingRoom() {
 
   const updateWaitingList = async (meetingId) => {
     try {
+      // Now we can query just the participants table since it contains emails
       const { data, error } = await supabase
         .from("participants")
         .select("id, user_id, email, status, created_at")
@@ -422,7 +444,7 @@ export default function MeetingRoom() {
           width: { ideal: isMobile ? 640 : 1280 },
           height: { ideal: isMobile ? 480 : 720 },
           frameRate: { ideal: isMobile ? 15 : 30 },
-          facingMode: "user",
+          facingMode: "user", // Always use front camera by default
         },
       };
 
@@ -957,20 +979,23 @@ export default function MeetingRoom() {
     vid.playsInline = true;
     vid.className = "w-full h-full object-cover";
 
+    // Get display info for this participant
     const displayInfo = participantNames[id];
     if (displayInfo) {
       const label = document.createElement("div");
-      label.className = 
+      label.className =
         "participant-label absolute bottom-2 left-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded";
       label.textContent = displayInfo;
       div.appendChild(label);
     }
 
+    // Speaking indicator
     const speakingIndicator = document.createElement("div");
-    speakingIndicator.className = 
+    speakingIndicator.className =
       "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
     speakingIndicator.id = `speaking-${id}`;
 
+    // Add elements to DOM
     div.appendChild(vid);
     div.appendChild(speakingIndicator);
     remoteVideosRef.current[id] = div;
@@ -978,29 +1003,30 @@ export default function MeetingRoom() {
     const container = document.getElementById("remote-videos");
     if (container) container.appendChild(div);
 
+    // Update the UI periodically to reflect changes
     const updateLabel = () => {
       if (!isMountedRef.current) return;
-      
+
       if (displayInfo) {
-        const currentLabel = div.querySelector('.participant-label');
+        const currentLabel = div.querySelector(".participant-label");
         if (currentLabel) {
-          currentLabel.textContent = participantNames[id] || `User ${id.slice(-4)}`;
+          currentLabel.textContent =
+            participantNames[id] || `User ${id.slice(-4)}`;
         }
       }
-      
+
       const indicator = div.querySelector(`#speaking-${id}`);
       if (indicator) {
         indicator.className = `absolute top-2 right-2 w-3 h-3 rounded-full ${
           activeSpeakers[id] ? "bg-green-500" : "bg-transparent"
         }`;
       }
-      
+
       requestAnimationFrame(updateLabel);
     };
-    
+
     updateLabel();
   };
-
   const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
     if (el) {
@@ -1019,131 +1045,73 @@ export default function MeetingRoom() {
 
   const loadMessagesAndReactions = async () => {
     try {
-      // Load initial messages with sender profiles
-      const { data: messages } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('room_id', roomId)
-        .order('created_at', { ascending: true });
+      const { data: oldMsgs } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+      setMessages(oldMsgs || []);
 
-      if (messages?.length) {
-        const senderEmails = [...new Set(messages.map(m => m.sender))];
-        const { data: profiles } = await supabase
-          .from('profiles')
-          .select('email, name')
-          .in('email', senderEmails);
-
-        const enrichedMessages = messages.map(msg => ({
-          ...msg,
-          senderName: profiles.find(p => p.email === msg.sender)?.name || msg.sender
-        }));
-
-        setMessages(enrichedMessages);
-      } else {
-        setMessages([]);
-      }
-
-      // Load initial reactions with user profiles
-      const { data: reactions } = await supabase
-        .from('reactions')
-        .select('*')
-        .eq('room_id', roomId)
-        .order('created_at', { ascending: true });
-
-      if (reactions?.length) {
-        const userIds = [...new Set(reactions.map(r => r.user_id))];
-        const { data: profiles } = await supabase
-          .from('profiles')
-          .select('id, name, email')
-          .in('id', userIds);
-
-        const enrichedReactions = reactions.map(react => ({
-          ...react,
-          userName: profiles.find(p => p.id === react.user_id)?.name || 
-                   profiles.find(p => p.id === react.user_id)?.email || 
-                   `User ${react.user_id.slice(0, 4)}`
-        }));
-
-        setReactions(enrichedReactions);
-      } else {
-        setReactions([]);
-      }
-
-      // Setup real-time subscriptions
       if (!messagesChannel.current) {
         messagesChannel.current = supabase
-          .channel(`room:${roomId}:messages`)
+          .channel(`messages:${roomId}`)
           .on(
-            'postgres_changes',
+            "postgres_changes",
             {
-              event: 'INSERT',
-              schema: 'public',
-              table: 'messages',
-              filter: `room_id=eq.${roomId}`
+              event: "INSERT",
+              schema: "public",
+              table: "messages",
+              filter: `room_id=eq.${roomId}`,
             },
-            async (payload) => {
-              const { data: profile } = await supabase
-                .from('profiles')
-                .select('name')
-                .eq('email', payload.new.sender)
-                .single();
-
-              setMessages(prev => [
-                ...prev,
-                {
-                  ...payload.new,
-                  senderName: profile?.name || payload.new.sender
-                }
-              ]);
+            (payload) => {
+              setMessages((prev) => [...prev, payload.new]);
             }
           )
           .subscribe();
       }
+
+      const { data: oldReacts } = await supabase
+        .from("reactions")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+
+      setReactions(oldReacts || []);
 
       if (!reactionsChannel.current) {
         reactionsChannel.current = supabase
-          .channel(`room:${roomId}:reactions`)
+          .channel(`reactions:${roomId}`)
           .on(
-            'postgres_changes',
+            "postgres_changes",
             {
-              event: '*',
-              schema: 'public',
-              table: 'reactions',
-              filter: `room_id=eq.${roomId}`
+              event: "*",
+              schema: "public",
+              table: "reactions",
+              filter: `room_id=eq.${roomId}`,
             },
-            async (payload) => {
-              if (payload.eventType === 'INSERT') {
-                const { data: profile } = await supabase
-                  .from('profiles')
-                  .select('name, email')
-                  .eq('id', payload.new.user_id)
-                  .single();
-
-                setReactions(prev => [
-                  ...prev,
-                  {
-                    ...payload.new,
-                    userName: profile?.name || profile?.email || `User ${payload.new.user_id.slice(0, 4)}`
-                  }
-                ]);
-
-                const senderName = profile?.name || profile?.email || 'A participant';
-                const systemMsg = {
-                  id: `react-${payload.new.id}`,
-                  room_id: roomId,
-                  sender: 'System',
-                  text: `${senderName} reacted with ${payload.new.emoji}`,
-                  created_at: new Date().toISOString(),
-                  senderName: 'System'
-                };
-                setMessages(prev => [...prev, systemMsg]);
-              }
-              else if (payload.eventType === 'DELETE') {
-                setReactions(prev => prev.filter(r => r.id !== payload.old.id));
+            (payload) => {
+              try {
+                if (payload.eventType === "INSERT") {
+                  setReactions((prev) => [...prev, payload.new]);
+                } else if (payload.eventType === "DELETE") {
+                  setReactions((prev) =>
+                    prev.filter((r) => r.id !== payload.old.id)
+                  );
+                }
+              } catch (e) {
+                console.error("Error processing reaction update:", e);
               }
             }
           )
-          .subscribe();
+          .subscribe((status, err) => {
+            if (err) {
+              setTimeout(() => {
+                if (reactionsChannel.current) {
+                  reactionsChannel.current.subscribe();
+                }
+              }, 2000);
+            }
+          });
       }
     } catch (error) {
       console.error("Error loading messages and reactions:", error);
@@ -1160,7 +1128,6 @@ export default function MeetingRoom() {
       sender: user.email,
       text: chatInput,
       created_at: new Date().toISOString(),
-      senderName: user.email // Temporary until we get the profile
     };
 
     setMessages((prev) => [...prev, newMessage]);
@@ -1195,7 +1162,6 @@ export default function MeetingRoom() {
       user_id: user.id,
       emoji,
       created_at: new Date().toISOString(),
-      userName: user.email // Temporary until we get the profile
     };
 
     setReactions((prev) => [...prev, newReaction]);
@@ -1234,7 +1200,6 @@ export default function MeetingRoom() {
         sender: "System",
         text: `${user.email} reacted with ${emoji}`,
         created_at: new Date().toISOString(),
-        senderName: "System"
       };
       setMessages((prev) => [...prev, newSystemMessage]);
     } catch (error) {
@@ -1249,6 +1214,7 @@ export default function MeetingRoom() {
 
   const approveUser = async (uid) => {
     try {
+      // First get the user's email from profiles
       const { data: userProfile } = await supabase
         .from("profiles")
         .select("email")
@@ -1259,13 +1225,15 @@ export default function MeetingRoom() {
         .from("participants")
         .update({
           status: "approved",
-          email: userProfile?.email,
+          email: userProfile?.email, // Store the email in participants table
           updated_at: new Date().toISOString(),
         })
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
 
       if (updateError) throw updateError;
+
+      // Rest of the approval logic...
     } catch (error) {
       console.error("Error approving user:", error);
       alert("Failed to approve user. Please try again.");
@@ -1396,9 +1364,14 @@ export default function MeetingRoom() {
     }
   };
 
+  // Add this state
+  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
+
+  // Enhanced approval handling
   useEffect(() => {
     if (!waitingForApproval || !meetingDbId || !user?.id) return;
 
+    // Real-time listener (primary method)
     const listener = supabase
       .channel(`approval:${meetingDbId}:${user.id}`)
       .on(
@@ -1417,6 +1390,7 @@ export default function MeetingRoom() {
       )
       .subscribe();
 
+    // Polling fallback
     const interval = setInterval(async () => {
       try {
         const { data } = await supabase
@@ -1430,18 +1404,20 @@ export default function MeetingRoom() {
           handleApproval();
           clearInterval(interval);
         } else {
-          setApprovalCheckCount(prev => prev + 1);
+          setApprovalCheckCount((prev) => prev + 1);
         }
       } catch (error) {
         console.error("Approval check error:", error);
       }
-    }, 10000);
+    }, 10000); // Check every 10 seconds
 
     const handleApproval = () => {
       setWaitingForApproval(false);
       setPermitToJoin(true);
       clearInterval(interval);
       supabase.removeChannel(listener);
+
+      // Initialize meeting connection
       initializeAfterApproval();
     };
 
@@ -1454,11 +1430,11 @@ export default function MeetingRoom() {
   const initializeAfterApproval = async () => {
     try {
       await requestMediaPermissions();
-      
+
       if (!peerRef.current) {
         const peer = createPeer(user.id);
         peerRef.current = peer;
-        
+
         peer.on("open", async (id) => {
           await supabase.from("signals").upsert({
             room_id: roomId,
@@ -1466,24 +1442,25 @@ export default function MeetingRoom() {
             user_id: user.id,
             last_active: new Date().toISOString(),
           });
-          
+
+          // Connect to existing participants
           const { data: others } = await supabase
             .from("signals")
             .select("peer_id")
             .eq("room_id", roomId)
             .neq("peer_id", id);
-            
+
           if (others?.length > 0) {
             others.forEach(({ peer_id }) => connectToPeer(peer_id));
           }
         });
-        
+
         peer.on("call", (call) => {
           call.answer(localStreamRef.current);
           setupCall(call, call.peer);
         });
       }
-      
+
       await updateParticipants(meetingDbId);
       setConnectionStatus("Connected to meeting");
     } catch (error) {
@@ -1676,6 +1653,28 @@ export default function MeetingRoom() {
     }
   }, []);
 
+  // Add this function
+  const setupApprovalEventSource = useCallback((meetingId, userId) => {
+    const eventSource = new EventSource(
+      `/api/approval-events?meeting=${meetingId}&user=${userId}`
+    );
+
+    eventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.status === "approved") {
+        setWaitingForApproval(false);
+        setPermitToJoin(true);
+        eventSource.close();
+      }
+    };
+
+    eventSource.onerror = () => {
+      setTimeout(() => setupApprovalEventSource(meetingId, userId), 5000);
+    };
+
+    return () => eventSource.close();
+  }, []);
+
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
 
@@ -1822,6 +1821,7 @@ export default function MeetingRoom() {
     };
   }, [needPasscode, initRoom, leaveRoom, isInitialized]);
 
+  // Add to your useEffect hooks
   useEffect(() => {
     if (waitingForApproval && !permitToJoin) {
       const approvalCheckInterval = setInterval(async () => {
@@ -1837,12 +1837,12 @@ export default function MeetingRoom() {
             setWaitingForApproval(false);
             setPermitToJoin(true);
             clearInterval(approvalCheckInterval);
-            window.location.reload();
+            window.location.reload(); // Last resort if other methods fail
           }
         } catch (error) {
           console.error("Approval check error:", error);
         }
-      }, 5000);
+      }, 5000); // Check every 5 seconds
 
       return () => clearInterval(approvalCheckInterval);
     }
@@ -2093,14 +2093,26 @@ export default function MeetingRoom() {
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
               <div className="flex items-center gap-3">
                 <div className="animate-spin text-blue-500">
-                  <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  <svg
+                    className="w-6 h-6"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                    />
                   </svg>
                 </div>
                 <div>
-                  <h3 className="font-medium text-blue-800">Waiting for host approval</h3>
+                  <h3 className="font-medium text-blue-800">
+                    Waiting for host approval
+                  </h3>
                   <p className="text-sm text-blue-600">
-                    {approvalCheckCount > 0 
+                    {approvalCheckCount > 0
                       ? `Still waiting... (checked ${approvalCheckCount} times)`
                       : "Your request has been sent to the host"}
                   </p>
@@ -2139,7 +2151,7 @@ export default function MeetingRoom() {
             <div className="p-3 h-60 overflow-y-auto space-y-2">
               {messages.map((msg) => (
                 <div key={msg.id} className="text-sm">
-                  <span className="font-semibold">{msg.senderName || msg.sender}: </span>
+                  <span className="font-semibold">{msg.sender}: </span>
                   <span>{msg.text}</span>
                 </div>
               ))}
@@ -2177,16 +2189,9 @@ export default function MeetingRoom() {
             </div>
             <div className="flex flex-wrap gap-2">
               {reactions.map((r) => (
-                <div 
-                  key={r.id} 
-                  className="text-2xl relative group"
-                  title={r.userName || `User ${r.user_id.slice(0,4)}`}
-                >
+                <span key={r.id} className="text-2xl">
                   {r.emoji}
-                  <span className="absolute hidden group-hover:block bottom-full left-1/2 transform -translate-x-1/2 bg-black text-white text-xs px-2 py-1 rounded whitespace-nowrap">
-                    {r.userName || `User ${r.user_id.slice(0,4)}`}
-                  </span>
-                </div>
+                </span>
               ))}
             </div>
           </div>
