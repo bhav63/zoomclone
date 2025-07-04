@@ -1152,7 +1152,7 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
-    // Optimistically update UI
+    // Optimistic UI update
     setMessages((prev) => [...prev, newMessage]);
     setChatInput("");
 
@@ -1174,6 +1174,7 @@ export default function MeetingRoom() {
       alert("Failed to send message. Please try again.");
     }
   };
+
   const sendReaction = async (emoji) => {
     if (!user?.id || !roomId) return;
     if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
@@ -1187,18 +1188,10 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
-    // Optimistically update UI
+    // Optimistic UI update
     setReactions((prev) => [...prev, newReaction]);
 
     try {
-      // Ensure user profile exists
-      const { error: profileError } = await supabase
-        .from("profiles")
-        .upsert({ id: user.id, email: user.email }, { onConflict: "id" });
-
-      if (profileError) throw profileError;
-
-      // Insert reaction
       const { error } = await supabase.from("reactions").insert({
         room_id: roomId,
         user_id: user.id,
@@ -1213,23 +1206,18 @@ export default function MeetingRoom() {
       }
 
       // Add system message about reaction
-      const { error: messageError } = await supabase.from("messages").insert({
+      await supabase.from("messages").insert({
         room_id: roomId,
         sender: "System",
         text: `${user.email} reacted with ${emoji}`,
         created_at: new Date().toISOString(),
       });
-
-      if (messageError) throw messageError;
     } catch (error) {
       console.error("Error sending reaction:", error);
-      if (error.code === "23503") {
-        alert("Your account isn't properly set up. Please refresh the page.");
-      } else {
-        alert(`Failed to send reaction: ${error.message}`);
-      }
+      alert(`Failed to send reaction: ${error.message}`);
     }
   };
+
   const approveUser = async (uid) => {
     try {
       // First get the user's email from profiles
@@ -1360,27 +1348,115 @@ export default function MeetingRoom() {
     }
   };
 
-  const cleanupSubscriptions = async () => {
-    try {
-      const channels = [
-        signalsChannel,
-        waitingChannel,
-        participantListener,
-        messagesChannel,
-        reactionsChannel,
-        participantsChannel,
-      ];
+  const setupRealTimeChannels = useCallback(() => {
+  // Clean up existing channels first
+  cleanupSubscriptions();
 
-      for (const channelRef of channels) {
-        if (channelRef.current) {
-          await supabase.removeChannel(channelRef.current);
-          channelRef.current = null;
+  // Only create new channels if they don't exist or are closed
+  if (!messagesChannel.current || messagesChannel.current.state !== 'joined') {
+    messagesChannel.current = supabase
+      .channel(`messages:${roomId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          setMessages((prev) => {
+            const exists = prev.some((msg) => msg.id === payload.new.id);
+            return exists ? prev : [...prev, payload.new];
+          });
         }
+      )
+      .subscribe((status, err) => {
+        if (err) {
+          console.error("Messages channel subscription error:", err);
+          setTimeout(setupRealTimeChannels, 2000);
+        }
+      });
+  }
+
+  if (!reactionsChannel.current || reactionsChannel.current.state !== 'joined') {
+    reactionsChannel.current = supabase
+      .channel(`reactions:${roomId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "reactions",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            setReactions((prev) => {
+              const exists = prev.some((react) => react.id === payload.new.id);
+              return exists ? prev : [...prev, payload.new];
+            });
+          } else if (payload.eventType === "DELETE") {
+            setReactions((prev) => prev.filter((r) => r.id !== payload.old.id));
+          }
+        }
+      )
+      .subscribe((status, err) => {
+        if (err) {
+          console.error("Reactions channel subscription error:", err);
+          setTimeout(setupRealTimeChannels, 2000);
+        }
+      });
+  }
+
+  if (!participantsChannel.current || participantsChannel.current.state !== 'joined') {
+    participantsChannel.current = supabase
+      .channel(`participants:${meetingDbId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${meetingDbId}`,
+        },
+        () => {
+          updateParticipants(meetingDbId);
+        }
+      )
+      .subscribe((status, err) => {
+        if (err) {
+          console.error("Participants channel subscription error:", err);
+          setTimeout(setupRealTimeChannels, 2000);
+        }
+      });
+  }
+}, [roomId, meetingDbId]);
+
+ const cleanupSubscriptions = async () => {
+  try {
+    const channels = [
+      signalsChannel,
+      waitingChannel,
+      participantListener,
+      messagesChannel,
+      reactionsChannel,
+      participantsChannel,
+    ];
+
+    for (const channelRef of channels) {
+      if (channelRef.current) {
+        // Only remove if the channel exists and is joined
+        if (channelRef.current.state === 'joined') {
+          await supabase.removeChannel(channelRef.current);
+        }
+        channelRef.current = null;
       }
-    } catch (error) {
-      console.warn("Error cleaning up subscriptions:", error);
     }
-  };
+  } catch (error) {
+    console.warn("Error cleaning up subscriptions:", error);
+  }
+};
 
   // Add this state
   const [approvalCheckCount, setApprovalCheckCount] = useState(0);
@@ -1866,15 +1942,43 @@ export default function MeetingRoom() {
     }
   }, [waitingForApproval, permitToJoin, meetingDbId, user?.id]);
 
-  useEffect(() => {
-    if (permitToJoin && roomId) {
-      loadMessagesAndReactions();
+ useEffect(() => {
+  if (permitToJoin && roomId && meetingDbId) {
+    // Only setup channels if they don't exist or are closed
+    if (!messagesChannel.current || messagesChannel.current.state !== 'joined' ||
+        !reactionsChannel.current || reactionsChannel.current.state !== 'joined') {
+      setupRealTimeChannels();
     }
+    loadMessagesAndReactions();
+  }
 
-    return () => {
-      cleanupSubscriptions();
-    };
-  }, [permitToJoin, roomId]);
+  return () => {
+    cleanupSubscriptions();
+  };
+}, [permitToJoin, roomId, meetingDbId, setupRealTimeChannels]);
+
+  useEffect(() => {
+  const checkConnection = async () => {
+    if (!messagesChannel.current || !reactionsChannel.current) return;
+
+    const messagesStatus = messagesChannel.current.state;
+    const reactionsStatus = reactionsChannel.current.state;
+
+    if (messagesStatus === "joined" && reactionsStatus === "joined") {
+      setConnectionStatus("Connected");
+    } else {
+      setConnectionStatus("Reconnecting...");
+      // Only attempt to reconnect if channels are not in the process of joining
+      if (messagesStatus !== "joining" && reactionsStatus !== "joining") {
+        setupRealTimeChannels();
+      }
+    }
+  };
+
+  const interval = setInterval(checkConnection, 5000);
+  return () => clearInterval(interval);
+}, [setupRealTimeChannels]);
+
 
   if (needPasscode) {
     return (
@@ -2024,7 +2128,7 @@ export default function MeetingRoom() {
             </button>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 mb-2">
             <div
               className={`w-3 h-3 rounded-full ${
                 connectionStatus === "Connected"
@@ -2035,6 +2139,14 @@ export default function MeetingRoom() {
               }`}
             ></div>
             <span className="text-sm">{connectionStatus}</span>
+            {connectionStatus !== "Connected" && (
+              <button
+                onClick={setupRealTimeChannels}
+                className="text-sm bg-gray-100 px-2 py-1 rounded hover:bg-gray-200"
+              >
+                Reconnect
+              </button>
+            )}
           </div>
         </div>
 
