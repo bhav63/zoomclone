@@ -19,11 +19,11 @@ export default function MeetingRoom() {
   const { roomId } = useParams();
   const navigate = useNavigate();
   const { search } = useLocation();
-
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
-  const [isSendingMessage, setIsSendingMessage] = useState(false);
+
   const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
 
   const [participants, setParticipants] = useState([]);
@@ -640,6 +640,7 @@ export default function MeetingRoom() {
 
       setRecordingAlertMessage("Recording started");
       setShowRecordingAlert(true);
+      alert("🔴 Recording started!");
       setTimeout(() => setShowRecordingAlert(false), 3000);
 
       let seconds = 0;
@@ -705,6 +706,8 @@ export default function MeetingRoom() {
 
       setRecordingAlertMessage("Recording saved successfully");
       setShowRecordingAlert(true);
+      alert("✅ Recording saved and uploaded successfully!");
+
       setTimeout(() => setShowRecordingAlert(false), 3000);
     } catch (err) {
       console.error("Recording stop error:", err);
@@ -1146,9 +1149,7 @@ export default function MeetingRoom() {
   if (isSendingMessage) return;
 
   setIsSendingMessage(true);
-
-  // Define tempId here at the function scope
-  const tempId = Date.now().toString();
+  const tempId = Date.now().toString(); // Define tempId here at function scope
 
   try {
     // Optimistic UI update
