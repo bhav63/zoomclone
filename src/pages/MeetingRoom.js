@@ -25,6 +25,7 @@ export default function MeetingRoom() {
   const [waitingList, setWaitingList] = useState([]);
 
   const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
+
   const [participants, setParticipants] = useState([]);
   const [permitToJoin, setPermitToJoin] = useState(false);
   const [meetingDbId, setMeetingDbId] = useState(null);
@@ -53,6 +54,7 @@ export default function MeetingRoom() {
     isReconnecting: false,
     attempts: 0,
   });
+
   const peerRef = useRef();
   const localStreamRef = useRef();
   const screenStreamRef = useRef();
@@ -66,7 +68,7 @@ export default function MeetingRoom() {
   const analysersRef = useRef({});
   const peerConnectionsRef = useRef({});
   const statsIntervalRef = useRef();
-  const messagesChannel = useRef(null);
+
   const recordingTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
   const pendingPeerConnections = useRef(new Set());
@@ -75,8 +77,8 @@ export default function MeetingRoom() {
   const waitingChannel = useRef();
   const participantListener = useRef();
   const signalsChannel = useRef();
-  const reactionsChannel = useRef(null);
-
+  const messagesChannel = useRef();
+  const reactionsChannel = useRef();
   const participantsChannel = useRef();
   const refreshInterval = useRef();
   const reconnectTimerRef = useRef();
@@ -1139,295 +1141,82 @@ export default function MeetingRoom() {
   };
 
   const sendMessage = async () => {
-  if (!chatInput.trim() || !user?.email) return;
+    if (!chatInput.trim() || !user?.email) return;
 
-  // Create optimistic update
-  const tempId = `temp-${Date.now()}`;
-  const optimisticMessage = {
-    id: tempId,
-    room_id: roomId,
-    sender: user.email,
-    text: chatInput,
-    created_at: new Date().toISOString(),
-    senderName: user.email.split('@')[0],
-    timestamp: new Date().toLocaleTimeString(),
-    isOptimistic: true
-  };
-
-  setMessages(prev => [...prev, optimisticMessage]);
-  setChatInput("");
-
-  try {
-    // Send to database
-    const { error } = await supabase.from("messages").insert({
+    const tempId = Date.now().toString();
+    const newMessage = {
+      id: tempId,
       room_id: roomId,
       sender: user.email,
       text: chatInput,
       created_at: new Date().toISOString(),
-    });
+    };
 
-    if (error) {
-      // Remove optimistic update if failed
-      setMessages(prev => prev.filter(msg => msg.id !== tempId));
-      throw error;
+    // Optimistic UI update
+    setMessages((prev) => [...prev, newMessage]);
+    setChatInput("");
+
+    try {
+      const { error } = await supabase.from("messages").insert({
+        room_id: roomId,
+        sender: user.email,
+        text: chatInput,
+        created_at: new Date().toISOString(),
+      });
+
+      if (error) {
+        // Rollback if error occurs
+        setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
+        throw error;
+      }
+    } catch (error) {
+      console.error("Error sending message:", error);
+      alert("Failed to send message. Please try again.");
     }
-  } catch (error) {
-    console.error("Error sending message:", error);
-    alert("Failed to send message. Please try again.");
-  }
-};
-
-const sendReaction = async (emoji) => {
-  if (!user?.id || !roomId) return;
-  if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
-
-  const tempId = `react-${Date.now()}`;
-  const newReaction = {
-    id: tempId,
-    room_id: roomId,
-    user_id: user.id,
-    emoji,
-    created_at: new Date().toISOString(),
-    userName: user.email // Temporary until we get the profile
   };
 
-  // Optimistic update
-  setReactions(prev => [...prev, newReaction]);
+  const sendReaction = async (emoji) => {
+    if (!user?.id || !roomId) return;
+    if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
 
-  try {
-    const { error } = await supabase.from("reactions").insert({
+    const tempId = Date.now().toString();
+    const newReaction = {
+      id: tempId,
       room_id: roomId,
       user_id: user.id,
       emoji,
       created_at: new Date().toISOString(),
-    });
+    };
 
-    if (error) {
-      // Rollback if failed
-      setReactions(prev => prev.filter(r => r.id !== tempId));
-      throw error;
+    // Optimistic UI update
+    setReactions((prev) => [...prev, newReaction]);
+
+    try {
+      const { error } = await supabase.from("reactions").insert({
+        room_id: roomId,
+        user_id: user.id,
+        emoji,
+        created_at: new Date().toISOString(),
+      });
+
+      if (error) {
+        // Rollback if error occurs
+        setReactions((prev) => prev.filter((r) => r.id !== tempId));
+        throw error;
+      }
+
+      // Add system message about reaction
+      await supabase.from("messages").insert({
+        room_id: roomId,
+        sender: "System",
+        text: `${user.email} reacted with ${emoji}`,
+        created_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("Error sending reaction:", error);
+      alert(`Failed to send reaction: ${error.message}`);
     }
-
-    // Add system message
-    const systemMsg = {
-      id: `sys-${Date.now()}`,
-      room_id: roomId,
-      sender: "System",
-      text: `${user.email} reacted with ${emoji}`,
-      created_at: new Date().toISOString(),
-      senderName: "System"
-    };
-    setMessages(prev => [...prev, systemMsg]);
-  } catch (error) {
-    console.error("Error sending reaction:", error);
-    alert(`Failed to send reaction: ${error.message}`);
-  }
-};
-
-  const setupReactionsChannel = useCallback(() => {
-    if (reactionsChannel.current || !roomId) return;
-
-    // Load initial reactions
-    const loadInitialReactions = async () => {
-      try {
-        const { data: reactions, error } = await supabase
-          .from("reactions")
-          .select("*")
-          .eq("room_id", roomId)
-          .order("created_at", { ascending: true });
-
-        if (error) throw error;
-        setReactions(reactions || []);
-      } catch (error) {
-        console.error("Error loading initial reactions:", error);
-      }
-    };
-
-    loadInitialReactions();
-
-    reactionsChannel.current = supabase
-      .channel(`room:${roomId}:reactions`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "reactions",
-          filter: `room_id=eq.${roomId}`,
-        },
-        async (payload) => {
-          try {
-            if (payload.eventType === "INSERT") {
-              // Get user profile for reaction
-              const { data: profile } = await supabase
-                .from("profiles")
-                .select("name, email")
-                .eq("id", payload.new.user_id)
-                .single();
-
-              setReactions((prev) => [
-                ...prev,
-                {
-                  ...payload.new,
-                  userName:
-                    profile?.name ||
-                    profile?.email ||
-                    `User ${payload.new.user_id.slice(0, 4)}`,
-                },
-              ]);
-
-              // Add system message about reaction
-              const senderName =
-                profile?.name || profile?.email || "A participant";
-              const systemMsg = {
-                id: `react-${payload.new.id}`,
-                room_id: roomId,
-                sender: "System",
-                text: `${senderName} reacted with ${payload.new.emoji}`,
-                created_at: new Date().toISOString(),
-                senderName: "System",
-              };
-              setMessages((prev) => [...prev, systemMsg]);
-            } else if (payload.eventType === "DELETE") {
-              setReactions((prev) =>
-                prev.filter((r) => r.id !== payload.old.id)
-              );
-            }
-          } catch (error) {
-            console.error("Error processing reaction update:", error);
-          }
-        }
-      )
-      .subscribe((status, err) => {
-        if (err) {
-          console.error("Reactions channel error:", err);
-          setTimeout(() => setupReactionsChannel(), 2000);
-        }
-      });
-
-    return () => {
-      if (reactionsChannel.current) {
-        supabase.removeChannel(reactionsChannel.current);
-        reactionsChannel.current = null;
-      }
-    };
-  }, [roomId]);
-
-  const setupMessagesChannel = useCallback(() => {
-    if (messagesChannel.current || !roomId) return;
-
-    // First load existing messages
-    const loadInitialMessages = async () => {
-      try {
-        const { data: messages, error } = await supabase
-          .from("messages")
-          .select("*")
-          .eq("room_id", roomId)
-          .order("created_at", { ascending: true });
-
-        if (error) throw error;
-
-        if (messages?.length) {
-          // Batch fetch profiles for all senders
-          const senderEmails = [...new Set(messages.map((m) => m.sender))];
-          const { data: profiles } = await supabase
-            .from("profiles")
-            .select("email, name")
-            .in("email", senderEmails);
-
-          // Enrich messages with sender names
-          const enrichedMessages = messages.map((msg) => ({
-            ...msg,
-            senderName:
-              profiles.find((p) => p.email === msg.sender)?.name ||
-              msg.sender.split("@")[0],
-            timestamp: new Date(msg.created_at).toLocaleTimeString(),
-          }));
-
-          setMessages(enrichedMessages);
-        }
-      } catch (error) {
-        console.error("Error loading initial messages:", error);
-      }
-    };
-
-    loadInitialMessages();
-
-    // Setup real-time subscription
-    messagesChannel.current = supabase
-      .channel(`room:${roomId}:messages`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${roomId}`,
-        },
-        async (payload) => {
-          try {
-            // Get sender profile
-            const { data: profile } = await supabase
-              .from("profiles")
-              .select("name")
-              .eq("email", payload.new.sender)
-              .single();
-
-            const newMessage = {
-              ...payload.new,
-              senderName: profile?.name || payload.new.sender.split("@")[0],
-              timestamp: new Date(payload.new.created_at).toLocaleTimeString(),
-            };
-
-            // Update state
-            setMessages((prev) => [...prev, newMessage]);
-
-            // Auto-scroll to bottom
-            setTimeout(() => {
-              const chatContainer = document.querySelector(".chat-messages");
-              if (chatContainer) {
-                chatContainer.scrollTop = chatContainer.scrollHeight;
-              }
-            }, 50);
-          } catch (error) {
-            console.error("Error processing new message:", error);
-            // Fallback - add basic message data
-            setMessages((prev) => [
-              ...prev,
-              {
-                ...payload.new,
-                senderName: payload.new.sender.split("@")[0],
-                timestamp: new Date(
-                  payload.new.created_at
-                ).toLocaleTimeString(),
-              },
-            ]);
-          }
-        }
-      )
-      .subscribe((status, err) => {
-        if (err) {
-          console.error("Message subscription error:", err);
-          // Exponential backoff for reconnection
-          const delay = Math.min(
-            2000 * Math.pow(2, err.retryCount || 0),
-            30000
-          );
-          setTimeout(() => {
-            if (isMountedRef.current && messagesChannel.current) {
-              messagesChannel.current.subscribe();
-            }
-          }, delay);
-        }
-      });
-
-    return () => {
-      if (messagesChannel.current) {
-        supabase.removeChannel(messagesChannel.current);
-        messagesChannel.current = null;
-      }
-    };
-  }, [roomId]);
+  };
 
   const approveUser = async (uid) => {
     try {
@@ -1982,8 +1771,6 @@ const sendReaction = async (emoji) => {
                   }
                 });
             }
-            setupMessagesChannel();
-            setupReactionsChannel();
           } catch (err) {
             console.error("Error in peer open handler:", err);
             setTimeout(() => {
@@ -2600,23 +2387,23 @@ const sendReaction = async (emoji) => {
                 ×
               </button>
             </div>
-            <div className="chat-messages p-3 h-60 overflow-y-auto space-y-3">
+            <div
+              className="p-3 h-60 overflow-y-auto space-y-2"
+              ref={(el) => {
+                if (el) {
+                  // Auto-scroll to bottom when new messages arrive
+                  el.scrollTop = el.scrollHeight;
+                }
+              }}
+            >
               {messages.map((msg) => (
-                <div key={msg.id} className="text-sm">
-                  <div className="flex justify-between items-start">
-                    <span className="font-semibold">
-                      {msg.senderName || msg.sender.split("@")[0]}
-                    </span>
-                    <span className="text-xs text-gray-500">
-                      {msg.timestamp}
-                    </span>
-                  </div>
-                  <p className="mt-1">{msg.text}</p>
-                  {msg.sender === "System" && (
-                    <div className="text-xs text-gray-500 italic">
-                      system message
-                    </div>
-                  )}
+                <div
+                  key={msg.id}
+                  className="text-sm cursor-pointer hover:bg-gray-100 p-1 rounded"
+                  onClick={() => window.location.reload()}
+                >
+                  <span className="font-semibold">{msg.sender}: </span>
+                  <span>{msg.text}</span>
                 </div>
               ))}
             </div>
@@ -2627,12 +2414,11 @@ const sendReaction = async (emoji) => {
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && sendMessage()}
                 placeholder="Type a message..."
-                className="flex-1 border p-2 rounded-l focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="flex-1 border p-2 rounded-l"
               />
               <button
                 onClick={sendMessage}
-                disabled={!chatInput.trim()}
-                className="bg-blue-500 text-white p-2 rounded-r hover:bg-blue-600 disabled:bg-gray-400"
+                className="bg-blue-500 text-white p-2 rounded-r hover:bg-blue-600"
               >
                 Send
               </button>
@@ -2654,16 +2440,13 @@ const sendReaction = async (emoji) => {
             </div>
             <div className="flex flex-wrap gap-2">
               {reactions.map((r) => (
-                <div
+                <span
                   key={r.id}
-                  className="text-2xl relative group"
-                  title={r.userName || `User ${r.user_id.slice(0, 4)}`}
+                  className="text-2xl cursor-pointer hover:scale-110 transition-transform"
+                  onClick={() => window.location.reload()}
                 >
                   {r.emoji}
-                  <span className="absolute hidden group-hover:block bottom-full left-1/2 transform -translate-x-1/2 bg-black text-white text-xs px-2 py-1 rounded whitespace-nowrap">
-                    {r.userName || `User ${r.user_id.slice(0, 4)}`}
-                  </span>
-                </div>
+                </span>
               ))}
             </div>
           </div>
