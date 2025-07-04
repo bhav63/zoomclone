@@ -23,7 +23,7 @@ export default function MeetingRoom() {
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
-
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
 
   const [participants, setParticipants] = useState([]);
@@ -68,6 +68,7 @@ export default function MeetingRoom() {
   const analysersRef = useRef({});
   const peerConnectionsRef = useRef({});
   const statsIntervalRef = useRef();
+  const messagesEndRef = useRef(null);
 
   const recordingTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
@@ -1141,9 +1142,16 @@ export default function MeetingRoom() {
   };
 
   const sendMessage = async () => {
-    if (!chatInput.trim() || !user?.email) return;
+  if (!chatInput.trim() || !user?.email) return;
+  if (isSendingMessage) return;
 
-    const tempId = Date.now().toString();
+  setIsSendingMessage(true);
+
+  // Define tempId here at the function scope
+  const tempId = Date.now().toString();
+
+  try {
+    // Optimistic UI update
     const newMessage = {
       id: tempId,
       room_id: roomId,
@@ -1152,28 +1160,33 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
-    // Optimistic UI update
     setMessages((prev) => [...prev, newMessage]);
     setChatInput("");
 
-    try {
-      const { error } = await supabase.from("messages").insert({
+    // Save to database
+    const { data, error } = await supabase
+      .from("messages")
+      .insert({
         room_id: roomId,
         sender: user.email,
         text: chatInput,
-        created_at: new Date().toISOString(),
-      });
+      })
+      .select()
+      .single();
 
-      if (error) {
-        // Rollback if error occurs
-        setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
-        throw error;
-      }
-    } catch (error) {
-      console.error("Error sending message:", error);
-      alert("Failed to send message. Please try again.");
-    }
-  };
+    if (error) throw error;
+
+    // Replace optimistic update with actual message from DB
+    setMessages((prev) => [...prev.filter((msg) => msg.id !== tempId), data]);
+  } catch (error) {
+    console.error("Failed to send message:", error);
+    // Rollback optimistic update
+    setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
+    alert("Failed to send message. Please try again.");
+  } finally {
+    setIsSendingMessage(false);
+  }
+};
 
   const sendReaction = async (emoji) => {
     if (!user?.id || !roomId) return;
@@ -2079,6 +2092,50 @@ export default function MeetingRoom() {
     return () => clearInterval(interval);
   }, [setupRealTimeChannels]);
 
+  useEffect(() => {
+    if (!permitToJoin || !meetingDbId) return;
+
+    const loadInitialMessages = async () => {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+
+      if (!error) setMessages(data || []);
+    };
+
+    loadInitialMessages();
+
+    const channel = supabase
+      .channel(`room:${roomId}:messages`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          setMessages((prev) => {
+            // Deduplicate messages
+            if (prev.some((m) => m.id === payload.new.id)) return prev;
+            return [...prev, payload.new];
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [roomId, permitToJoin, meetingDbId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
   if (needPasscode) {
     return (
       <div className="p-4 max-w-md mx-auto">
@@ -2387,40 +2444,96 @@ export default function MeetingRoom() {
                 ×
               </button>
             </div>
-            <div
-              className="p-3 h-60 overflow-y-auto space-y-2"
-              ref={(el) => {
-                if (el) {
-                  // Auto-scroll to bottom when new messages arrive
-                  el.scrollTop = el.scrollHeight;
-                }
-              }}
-            >
-              {messages.map((msg) => (
+
+            <div className="p-3 h-60 overflow-y-auto space-y-2">
+              {messages.map((message) => (
                 <div
-                  key={msg.id}
-                  className="text-sm cursor-pointer hover:bg-gray-100 p-1 rounded"
-                  onClick={() => window.location.reload()}
+                  key={message.id}
+                  className={`flex ${
+                    message.sender === user.email
+                      ? "justify-end"
+                      : "justify-start"
+                  }`}
                 >
-                  <span className="font-semibold">{msg.sender}: </span>
-                  <span>{msg.text}</span>
+                  <div
+                    className={`max-w-xs lg:max-w-md rounded-lg p-2 ${
+                      message.sender === user.email
+                        ? "bg-blue-500 text-white"
+                        : "bg-gray-200"
+                    }`}
+                  >
+                    <div className="font-semibold text-xs">
+                      {message.sender === user.email
+                        ? "You"
+                        : participantNames[message.sender] || message.sender}
+                    </div>
+                    <div className="text-sm">{message.text}</div>
+                    <div
+                      className={`text-xs mt-1 ${
+                        message.sender === user.email
+                          ? "text-blue-100"
+                          : "text-gray-500"
+                      }`}
+                    >
+                      {new Date(message.created_at).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </div>
+                  </div>
                 </div>
               ))}
+              <div ref={messagesEndRef} />
             </div>
-            <div className="p-3 border-t flex">
+
+            <div className="p-3 border-t flex items-center">
               <input
                 type="text"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                  }
+                }}
                 placeholder="Type a message..."
-                className="flex-1 border p-2 rounded-l"
+                className="flex-1 border p-2 rounded-l focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isSendingMessage}
               />
               <button
                 onClick={sendMessage}
-                className="bg-blue-500 text-white p-2 rounded-r hover:bg-blue-600"
+                disabled={isSendingMessage || !chatInput.trim()}
+                className={`p-2 rounded-r ${
+                  isSendingMessage || !chatInput.trim()
+                    ? "bg-gray-300 cursor-not-allowed"
+                    : "bg-blue-500 hover:bg-blue-600 text-white"
+                }`}
               >
-                Send
+                {isSendingMessage ? (
+                  <svg
+                    className="animate-spin h-5 w-5 text-white"
+                    xmlns="http://www.w3.org/2000/svg"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    ></circle>
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    ></path>
+                  </svg>
+                ) : (
+                  "Send"
+                )}
               </button>
             </div>
           </div>
@@ -2440,11 +2553,7 @@ export default function MeetingRoom() {
             </div>
             <div className="flex flex-wrap gap-2">
               {reactions.map((r) => (
-                <span
-                  key={r.id}
-                  className="text-2xl cursor-pointer hover:scale-110 transition-transform"
-                  onClick={() => window.location.reload()}
-                >
+                <span key={r.id} className="text-2xl">
                   {r.emoji}
                 </span>
               ))}
