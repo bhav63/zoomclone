@@ -48,6 +48,8 @@ export default function MeetingRoom() {
   const [showRecordingAlert, setShowRecordingAlert] = useState(false);
   const [recordingAlertMessage, setRecordingAlertMessage] = useState("");
   const [isMobile, setIsMobile] = useState(false);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [hasNewMessages, setHasNewMessages] = useState(false);
   const [reconnectionState, setReconnectionState] = useState({
     isReconnecting: false,
     attempts: 0,
@@ -85,6 +87,23 @@ export default function MeetingRoom() {
   const shareLink = `${BASE_URL}/room/${roomId}${
     passcodeRequired ? `?passcode=${encodeURIComponent(inputPasscode)}` : ""
   }`;
+
+
+
+   useEffect(() => {
+    if (messages.length > 0) {
+      setHasNewMessages(true);
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    if (hasNewMessages && isAtBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      setHasNewMessages(false);
+    }
+  }, [messages, hasNewMessages, isAtBottom]);
+
+  
 
   // Improved real-time message handling
   const setupRealTimeMessages = useCallback(() => {
@@ -1736,6 +1755,13 @@ export default function MeetingRoom() {
     }
   }, []);
 
+  const handleScroll = useCallback((e) => {
+    const element = e.target;
+    const atBottom =
+      element.scrollHeight - element.scrollTop <= element.clientHeight + 50; // 50px buffer
+    setIsAtBottom(atBottom);
+  }, []);
+
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
 
@@ -1953,9 +1979,11 @@ export default function MeetingRoom() {
     return () => clearInterval(interval);
   }, [setupRealTimeMessages, setupRealTimeReactions]);
 
+ 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  setIsAtBottom(false);
+}, []);
+
 
   if (needPasscode) {
     return (
@@ -2259,7 +2287,21 @@ export default function MeetingRoom() {
               showChat ? "block" : "hidden"
             }`}
           >
-            <div className="p-3 border-b flex justify-between items-center">
+            <div className="p-3 border-b flex justify-between items-center"
+             {...(!isAtBottom && (
+                <button
+                  onClick={() => {
+                    setIsAtBottom(true);
+                    messagesEndRef.current?.scrollIntoView({
+                      behavior: "smooth",
+                    });
+                  }}
+                  className="fixed bottom-24 right-6 bg-blue-500 text-white p-2 rounded-full shadow-lg z-10"
+                  style={{ right: showChat ? "1.5rem" : "calc(33% + 1.5rem)" }}
+                >
+                  ↓ New Messages
+                </button>
+              ))}>
               <h3 className="font-bold">💬 Chat</h3>
               <button
                 onClick={() => setShowChat(false)}
@@ -2269,7 +2311,8 @@ export default function MeetingRoom() {
               </button>
             </div>
 
-            <div className="p-3 h-60 overflow-y-auto space-y-2">
+            <div
+              className="p-3 h-60 overflow-y-auto space-y-2">
               {messages.map((message) => (
                 <div
                   key={message.id}
