@@ -93,22 +93,47 @@ export default function MeetingRoom() {
     }
 
     messagesChannel.current = supabase
-      .channel(`messages:${roomId}`)
+      .channel(`messages:${roomId}:${user?.id}`)
       .on(
         "postgres_changes",
         {
-          event: "*",
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${roomId}`,
+        },
+        async (payload) => {
+          // Check if we've already processed this message
+          const exists = messages.some((msg) => msg.id === payload.new.id);
+          if (exists) return;
+
+          // Add the message to state
+          setMessages((prev) => [...prev, payload.new]);
+
+          // Mark message as read
+          try {
+            await supabase.rpc("mark_message_as_read", {
+              message_id: payload.new.id,
+              user_id: user.id,
+            });
+          } catch (error) {
+            console.error("Error marking message as read:", error);
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
           schema: "public",
           table: "messages",
           filter: `room_id=eq.${roomId}`,
         },
         (payload) => {
-          if (payload.eventType === "INSERT") {
-            setMessages((prev) => {
-              const exists = prev.some((msg) => msg.id === payload.new.id);
-              return exists ? prev : [...prev, payload.new];
-            });
-          }
+          // Handle message updates (like read receipts)
+          setMessages((prev) =>
+            prev.map((msg) => (msg.id === payload.new.id ? payload.new : msg))
+          );
         }
       )
       .subscribe((status, err) => {
@@ -123,7 +148,7 @@ export default function MeetingRoom() {
         supabase.removeChannel(messagesChannel.current);
       }
     };
-  }, [roomId]);
+  }, [roomId, user?.id, messages]);
 
   // Improved real-time reactions handling
   const setupRealTimeReactions = useCallback(() => {
@@ -131,8 +156,11 @@ export default function MeetingRoom() {
       supabase.removeChannel(reactionsChannel.current);
     }
 
+    const reactionDebounce = {};
+    const debounceTime = 300; // ms
+
     reactionsChannel.current = supabase
-      .channel(`reactions:${roomId}`)
+      .channel(`reactions:${roomId}:${user?.id}`)
       .on(
         "postgres_changes",
         {
@@ -142,6 +170,13 @@ export default function MeetingRoom() {
           filter: `room_id=eq.${roomId}`,
         },
         (payload) => {
+          // Debounce rapid reaction updates
+          const now = Date.now();
+          const lastUpdate = reactionDebounce[payload.new.id] || 0;
+
+          if (now - lastUpdate < debounceTime) return;
+          reactionDebounce[payload.new.id] = now;
+
           if (payload.eventType === "INSERT") {
             setReactions((prev) => {
               const exists = prev.some((react) => react.id === payload.new.id);
@@ -164,6 +199,48 @@ export default function MeetingRoom() {
         supabase.removeChannel(reactionsChannel.current);
       }
     };
+  }, [roomId, user?.id]);
+
+  const loadMessages = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: false })
+        .limit(50); // Load most recent 50 messages
+
+      if (error) throw error;
+
+      // Reverse to show oldest first
+      setMessages(data.reverse());
+
+      // Mark all messages as read
+      if (data.length > 0 && user?.id) {
+        await supabase.rpc("mark_all_messages_as_read", {
+          room_id: roomId,
+          user_id: user.id,
+        });
+      }
+    } catch (error) {
+      console.error("Error loading messages:", error);
+    }
+  }, [roomId, user?.id]);
+
+  // Optimized reactions loading
+  const loadReactions = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("reactions")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+
+      if (error) throw error;
+      setReactions(data);
+    } catch (error) {
+      console.error("Error loading reactions:", error);
+    }
   }, [roomId]);
 
   const refreshMeetingState = useCallback(async () => {
@@ -1073,29 +1150,18 @@ export default function MeetingRoom() {
     }
   };
 
-  const loadMessagesAndReactions = async () => {
-    try {
-      const { data: oldMsgs } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-      setMessages(oldMsgs || []);
+  const loadMessagesAndReactions = useCallback(async () => {
+    await Promise.all([loadMessages(), loadReactions()]);
+    setupRealTimeMessages();
+    setupRealTimeReactions();
+  }, [
+    loadMessages,
+    loadReactions,
+    setupRealTimeMessages,
+    setupRealTimeReactions,
+  ]);
 
-      const { data: oldReacts } = await supabase
-        .from("reactions")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-      setReactions(oldReacts || []);
-
-      setupRealTimeMessages();
-      setupRealTimeReactions();
-    } catch (error) {
-      console.error("Error loading messages and reactions:", error);
-    }
-  };
-
+  // Improved message sending with optimistic updates
   const sendMessage = async () => {
     if (!chatInput.trim() || !user?.email) return;
     if (isSendingMessage) return;
@@ -1104,17 +1170,20 @@ export default function MeetingRoom() {
     const tempId = Date.now().toString();
 
     try {
+      // Optimistic update
       const newMessage = {
         id: tempId,
         room_id: roomId,
         sender: user.email,
         text: chatInput,
         created_at: new Date().toISOString(),
+        read_by: [user.id],
       };
 
       setMessages((prev) => [...prev, newMessage]);
       setChatInput("");
 
+      // Persist to database
       const { data, error } = await supabase
         .from("messages")
         .insert({
@@ -1127,9 +1196,17 @@ export default function MeetingRoom() {
 
       if (error) throw error;
 
-      setMessages((prev) => [...prev.filter((msg) => msg.id !== tempId), data]);
+      // Replace optimistic update with real message
+      setMessages((prev) => [
+        ...prev.filter((msg) => msg.id !== tempId),
+        { ...data, read_by: [user.id] },
+      ]);
+
+      // Scroll to bottom
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     } catch (error) {
       console.error("Failed to send message:", error);
+      // Rollback optimistic update
       setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
       alert("Failed to send message. Please try again.");
     } finally {
@@ -1137,9 +1214,62 @@ export default function MeetingRoom() {
     }
   };
 
+  // const sendMessage = async () => {
+  //   if (!chatInput.trim() || !user?.email) return;
+  //   if (isSendingMessage) return;
+
+  //   setIsSendingMessage(true);
+  //   const tempId = Date.now().toString();
+
+  //   try {
+  //     const newMessage = {
+  //       id: tempId,
+  //       room_id: roomId,
+  //       sender: user.email,
+  //       text: chatInput,
+  //       created_at: new Date().toISOString(),
+  //     };
+
+  //     setMessages((prev) => [...prev, newMessage]);
+  //     setChatInput("");
+
+  //     const { data, error } = await supabase
+  //       .from("messages")
+  //       .insert({
+  //         room_id: roomId,
+  //         sender: user.email,
+  //         text: chatInput,
+  //       })
+  //       .select()
+  //       .single();
+
+  //     if (error) throw error;
+
+  //     setMessages((prev) => [...prev.filter((msg) => msg.id !== tempId), data]);
+  //   } catch (error) {
+  //     console.error("Failed to send message:", error);
+  //     setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
+  //     alert("Failed to send message. Please try again.");
+  //   } finally {
+  //     setIsSendingMessage(false);
+  //   }
+  // };
+
   const sendReaction = async (emoji) => {
     if (!user?.id || !roomId) return;
     if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
+
+    // Check if user already sent this reaction recently
+    const lastReaction = reactions.find(
+      (r) => r.user_id === user.id && r.emoji === emoji
+    );
+
+    if (
+      lastReaction &&
+      Date.now() - new Date(lastReaction.created_at).getTime() < 1000
+    ) {
+      return; // Prevent rapid duplicate reactions
+    }
 
     const tempId = Date.now().toString();
     const newReaction = {
@@ -1150,6 +1280,7 @@ export default function MeetingRoom() {
       created_at: new Date().toISOString(),
     };
 
+    // Optimistic update
     setReactions((prev) => [...prev, newReaction]);
 
     try {
@@ -1157,14 +1288,15 @@ export default function MeetingRoom() {
         room_id: roomId,
         user_id: user.id,
         emoji,
-        created_at: new Date().toISOString(),
       });
 
       if (error) {
+        // Rollback optimistic update
         setReactions((prev) => prev.filter((r) => r.id !== tempId));
         throw error;
       }
 
+      // Add system message about reaction
       await supabase.from("messages").insert({
         room_id: roomId,
         sender: "System",
@@ -1791,7 +1923,13 @@ export default function MeetingRoom() {
         supabase.removeChannel(reactionsChannel.current);
       }
     };
-  }, [permitToJoin, roomId, meetingDbId, setupRealTimeMessages, setupRealTimeReactions]);
+  }, [
+    permitToJoin,
+    roomId,
+    meetingDbId,
+    setupRealTimeMessages,
+    setupRealTimeReactions,
+  ]);
 
   useEffect(() => {
     const checkConnection = async () => {
@@ -2145,26 +2283,38 @@ export default function MeetingRoom() {
                     className={`max-w-xs lg:max-w-md rounded-lg p-2 ${
                       message.sender === user.email
                         ? "bg-blue-500 text-white"
+                        : message.sender === "System"
+                        ? "bg-gray-100 text-gray-700 italic"
                         : "bg-gray-200"
                     }`}
                   >
                     <div className="font-semibold text-xs">
                       {message.sender === user.email
                         ? "You"
+                        : message.sender === "System"
+                        ? "System"
                         : participantNames[message.sender] || message.sender}
                     </div>
                     <div className="text-sm">{message.text}</div>
-                    <div
-                      className={`text-xs mt-1 ${
-                        message.sender === user.email
-                          ? "text-blue-100"
-                          : "text-gray-500"
-                      }`}
-                    >
-                      {new Date(message.created_at).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
+                    <div className="flex justify-between items-center mt-1">
+                      <div
+                        className={`text-xs ${
+                          message.sender === user.email
+                            ? "text-blue-100"
+                            : "text-gray-500"
+                        }`}
+                      >
+                        {new Date(message.created_at).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </div>
+                      {message.sender !== user.email &&
+                        message.sender !== "System" && (
+                          <div className="text-xs text-gray-400 ml-2">
+                            {message.read_by?.includes(user.id) ? "✓✓" : "✓"}
+                          </div>
+                        )}
                     </div>
                   </div>
                 </div>
