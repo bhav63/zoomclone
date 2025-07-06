@@ -3,7 +3,6 @@ import { useParams, useNavigate, useLocation } from "react-router-dom";
 import Peer from "peerjs";
 import RecordRTC from "recordrtc";
 import { supabase } from "../supabaseClient";
-import useSupabaseChannels from '../hooks/useSupabaseChannels';
 
 const getStablePeerId = (userId) => {
   const storedId = sessionStorage.getItem(`peerId-${userId}`);
@@ -20,13 +19,13 @@ export default function MeetingRoom() {
   const { roomId } = useParams();
   const navigate = useNavigate();
   const { search } = useLocation();
+  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
+
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
-  const { subscribe, unsubscribeAll } = useSupabaseChannels();
   const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
-
   const [participants, setParticipants] = useState([]);
   const [permitToJoin, setPermitToJoin] = useState(false);
   const [meetingDbId, setMeetingDbId] = useState(null);
@@ -55,7 +54,8 @@ export default function MeetingRoom() {
     isReconnecting: false,
     attempts: 0,
   });
-
+  const [isConnected, setIsConnected] = useState(false);
+  const refreshInterval = useRef();
   const peerRef = useRef();
   const localStreamRef = useRef();
   const screenStreamRef = useRef();
@@ -70,19 +70,12 @@ export default function MeetingRoom() {
   const peerConnectionsRef = useRef({});
   const statsIntervalRef = useRef();
   const messagesEndRef = useRef(null);
-
   const recordingTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
   const pendingPeerConnections = useRef(new Set());
   const activePeerConnections = useRef(new Set());
   const screenShareContainerRef = useRef(null);
-  const waitingChannel = useRef();
-  const participantListener = useRef();
-  const signalsChannel = useRef();
-  const messagesChannel = useRef();
-  const reactionsChannel = useRef();
-  const participantsChannel = useRef();
-  const refreshInterval = useRef();
+  const channelsRef = useRef({});
   const reconnectTimerRef = useRef();
 
   const BASE_URL = "https://zoomclone-v3.vercel.app";
@@ -90,17 +83,51 @@ export default function MeetingRoom() {
     passcodeRequired ? `?passcode=${encodeURIComponent(inputPasscode)}` : ""
   }`;
 
+  // Realtime subscription management
+  const subscribe = useCallback((name, config) => {
+    if (
+      channelsRef.current[name] &&
+      channelsRef.current[name].state === "joined"
+    ) {
+      return channelsRef.current[name];
+    }
+
+    if (channelsRef.current[name]) {
+      supabase.removeChannel(channelsRef.current[name]);
+    }
+
+    const channel = supabase
+      .channel(config.channelName)
+      .on("postgres_changes", config.options, config.callback)
+      .subscribe((status, err) => {
+        if (err) {
+          console.error(`${name} channel error:`, err);
+          setTimeout(() => subscribe(name, config), 2000);
+        }
+      });
+
+    channelsRef.current[name] = channel;
+    return channel;
+  }, []);
+
+  const unsubscribe = useCallback((name) => {
+    if (channelsRef.current[name]) {
+      supabase.removeChannel(channelsRef.current[name]);
+      delete channelsRef.current[name];
+    }
+  }, []);
+
+  const unsubscribeAll = useCallback(() => {
+    Object.keys(channelsRef.current).forEach(unsubscribe);
+    channelsRef.current = {};
+  }, [unsubscribe]);
+
   const refreshMeetingState = useCallback(async () => {
     if (!isMountedRef.current || !meetingDbId || !user?.id) return;
 
     try {
-      if (permitToJoin) {
-        await updateParticipants(meetingDbId);
-      }
-
-      if (isHost) {
-        await updateWaitingList(meetingDbId);
-      }
+      if (permitToJoin) await updateParticipants(meetingDbId);
+      if (isHost) await updateWaitingList(meetingDbId);
 
       if (peerRef.current?.id) {
         const { data: others } = await supabase
@@ -134,304 +161,6 @@ export default function MeetingRoom() {
     }
   }, [meetingDbId, user?.id, permitToJoin, isHost, roomId]);
 
-  useEffect(() => {
-    if (permitToJoin && !autoRefreshIntervalRef.current) {
-      autoRefreshIntervalRef.current = setInterval(() => {
-        refreshMeetingState();
-      }, AUTO_REFRESH_INTERVAL);
-    }
-
-    return () => {
-      if (autoRefreshIntervalRef.current) {
-        clearInterval(autoRefreshIntervalRef.current);
-        autoRefreshIntervalRef.current = null;
-      }
-    };
-  }, [permitToJoin, refreshMeetingState]);
-
-  useEffect(() => {
-    const checkIfMobile = () => {
-      setIsMobile(
-        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-          navigator.userAgent
-        )
-      );
-    };
-    checkIfMobile();
-  }, []);
-
-  useEffect(() => {
-    if (!meetingDbId || !isHost) return;
-
-    // Set up real-time listener for participant changes
-    const participantListener = supabase
-      .channel(`participant_changes:${meetingDbId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "participants",
-          filter: `meeting_id=eq.${meetingDbId}`,
-        },
-        (payload) => {
-          console.log("Participant change detected:", payload);
-          updateWaitingList(meetingDbId);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(participantListener);
-    };
-  }, [meetingDbId, isHost]);
-
-  const ensureProfileExists = async (userId) => {
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser();
-    if (authError) throw authError;
-
-    const { error } = await supabase
-      .from("profiles")
-      .upsert({ id: userId, email: user.email }, { onConflict: "id" });
-
-    if (error) throw error;
-  };
-
-  const createPendingRequest = async (meetingId, userId) => {
-    try {
-      await ensureProfileExists(userId);
-
-      const { error } = await supabase.from("participants").upsert(
-        {
-          meeting_id: meetingId,
-          user_id: userId,
-          status: "pending",
-          created_at: new Date().toISOString(),
-        },
-        { onConflict: "meeting_id,user_id" }
-      );
-
-      if (error) throw error;
-      setWaitingForApproval(true);
-    } catch (error) {
-      console.error("Error in createPendingRequest:", error);
-      alert("Failed to create join request. Please try again.");
-    }
-  };
-
-  const setupWaitingListener = useCallback((mtId) => {
-    updateWaitingList(mtId);
-
-    if (!waitingChannel.current) {
-      waitingChannel.current = supabase
-        .channel(`waiting:${mtId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId}`,
-          },
-          (payload) => {
-            updateWaitingList(mtId);
-          }
-        )
-        .subscribe();
-    }
-  }, []);
-
-  // In setupParticipantListener
-  const setupParticipantListener = useCallback(
-    (mtId, uid) => {
-      if (!participantListener.current) {
-        participantListener.current = supabase
-          .channel(`participant:${mtId}:${uid}`)
-          .on(
-            "postgres_changes",
-            {
-              event: "UPDATE",
-              schema: "public",
-              table: "participants",
-              filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
-            },
-            async (payload) => {
-              if (payload.new.status === "approved") {
-                setWaitingForApproval(false);
-                setPermitToJoin(true);
-
-                try {
-                  // Initialize media and peer connection if not already done
-                  if (!localStreamRef.current) {
-                    await requestMediaPermissions();
-                  }
-
-                  if (!peerRef.current) {
-                    const peer = createPeer(user.id);
-                    peerRef.current = peer;
-
-                    peer.on("open", async (id) => {
-                      await supabase.from("signals").upsert({
-                        room_id: roomId,
-                        peer_id: id,
-                        user_id: user.id,
-                        last_active: new Date().toISOString(),
-                      });
-
-                      // Connect to existing participants
-                      const { data: others } = await supabase
-                        .from("signals")
-                        .select("peer_id")
-                        .eq("room_id", roomId)
-                        .neq("peer_id", id);
-
-                      if (others?.length > 0) {
-                        others.forEach(({ peer_id }) => connectToPeer(peer_id));
-                      }
-                    });
-
-                    peer.on("call", (call) => {
-                      call.answer(localStreamRef.current);
-                      setupCall(call, call.peer);
-                    });
-                  }
-
-                  // Force refresh of participants list
-                  await updateParticipants(mtId);
-                  setConnectionStatus("Connected to meeting");
-                } catch (error) {
-                  console.error("Approval handling error:", error);
-                  setConnectionStatus("Connection failed - retrying...");
-                  setTimeout(() => setupParticipantListener(mtId, uid), 3000);
-                }
-              }
-            }
-          )
-          .subscribe();
-      }
-    },
-    [roomId, user?.id]
-  );
-
-  const updateParticipants = async (meetingId) => {
-    try {
-      // Get all approved participants with their user_ids
-      const { data: participantsData, error: participantsError } =
-        await supabase
-          .from("participants")
-          .select("user_id, status, email, display_name")
-          .eq("meeting_id", meetingId)
-          .eq("status", "approved");
-
-      if (participantsError) throw participantsError;
-
-      // Get all active signals (peer connections)
-      const { data: signalsData, error: signalsError } = await supabase
-        .from("signals")
-        .select("peer_id, user_id")
-        .eq("room_id", roomId);
-
-      if (signalsError) throw signalsError;
-
-      if (participantsData && signalsData) {
-        setParticipants(participantsData);
-
-        // Get unique user IDs from participants and signals
-        const participantUserIds = participantsData.map((p) => p.user_id);
-        const signalUserIds = signalsData.map((s) => s.user_id);
-        const allUserIds = [
-          ...new Set([...participantUserIds, ...signalUserIds]),
-        ];
-
-        // Fetch profile data for all users who might be missing emails
-        const { data: profilesData, error: profilesError } = await supabase
-          .from("profiles")
-          .select("id, email, name")
-          .in("id", allUserIds);
-
-        if (profilesError) throw profilesError;
-
-        // Create mapping of user_id to display info
-        const userInfoMap = {};
-
-        // First use participant data (which may have display_name)
-        participantsData.forEach((p) => {
-          userInfoMap[p.user_id] = {
-            email: p.email || null,
-            displayName: p.display_name || null,
-          };
-        });
-
-        // Then supplement with profile data where needed
-        profilesData.forEach((profile) => {
-          if (!userInfoMap[profile.id] || !userInfoMap[profile.id].email) {
-            userInfoMap[profile.id] = {
-              email: profile.email || null,
-              displayName: profile.name || null,
-            };
-          }
-        });
-
-        // Create mapping of peer_id to user_id
-        const newPeerToUserIdMap = {};
-        signalsData.forEach((s) => {
-          newPeerToUserIdMap[s.peer_id] = s.user_id;
-        });
-        setPeerToUserIdMap(newPeerToUserIdMap);
-
-        // Create mapping of peer_id to display info
-        const newParticipantNames = {};
-        signalsData.forEach((s) => {
-          const userInfo = userInfoMap[s.user_id];
-          if (userInfo) {
-            // Prefer display_name from participants, then name from profiles, then email
-            newParticipantNames[s.peer_id] =
-              userInfo.displayName ||
-              userInfo.email ||
-              `User ${s.user_id.slice(0, 4)}`;
-          }
-        });
-        setParticipantNames(newParticipantNames);
-
-        // Update any existing remote video labels
-        Object.keys(remoteVideosRef.current).forEach((peerId) => {
-          const videoDiv = remoteVideosRef.current[peerId];
-          if (videoDiv) {
-            const label = videoDiv.querySelector(".participant-label");
-            if (label && newParticipantNames[peerId]) {
-              label.textContent = newParticipantNames[peerId];
-            }
-          }
-        });
-      }
-    } catch (error) {
-      console.error("Error updating participants:", error);
-    }
-  };
-
-  const updateWaitingList = async (meetingId) => {
-    try {
-      // Now we can query just the participants table since it contains emails
-      const { data, error } = await supabase
-        .from("participants")
-        .select("id, user_id, email, status, created_at")
-        .eq("meeting_id", meetingId)
-        .eq("status", "pending")
-        .order("created_at", { ascending: true });
-
-      if (error) throw error;
-
-      console.log("Waiting list data:", data);
-      setWaitingList(data || []);
-    } catch (error) {
-      console.error("Error fetching waiting list:", error);
-      setWaitingList([]);
-    }
-  };
-
   const requestMediaPermissions = async () => {
     if (localStreamRef.current) return localStreamRef.current;
 
@@ -446,7 +175,7 @@ export default function MeetingRoom() {
           width: { ideal: isMobile ? 640 : 1280 },
           height: { ideal: isMobile ? 480 : 720 },
           frameRate: { ideal: isMobile ? 15 : 30 },
-          facingMode: "user", // Always use front camera by default
+          facingMode: "user",
         },
       };
 
@@ -466,33 +195,23 @@ export default function MeetingRoom() {
     } catch (err) {
       console.error("Media permission error:", err);
       try {
-        const fallbackConstraints = {
+        const fallbackStream = await navigator.mediaDevices.getUserMedia({
           audio: true,
           video: isMobile ? { facingMode: "user" } : true,
-        };
-
-        const fallbackStream = await navigator.mediaDevices.getUserMedia(
-          fallbackConstraints
-        );
+        });
         localStreamRef.current = fallbackStream;
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = fallbackStream;
           localVideoRef.current.style.transform = "scaleX(-1)";
         }
-
         return fallbackStream;
       } catch (fallbackError) {
         console.error("Fallback media error:", fallbackError);
-        try {
-          const audioOnlyStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-          });
-          localStreamRef.current = audioOnlyStream;
-          return audioOnlyStream;
-        } catch (audioError) {
-          console.error("Audio only fallback failed:", audioError);
-          throw audioError;
-        }
+        const audioOnlyStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        localStreamRef.current = audioOnlyStream;
+        return audioOnlyStream;
       }
     }
   };
@@ -616,12 +335,10 @@ export default function MeetingRoom() {
     }
     try {
       const combinedStream = new MediaStream();
-
       const videoSource =
         isScreenSharing && screenStreamRef.current
           ? screenStreamRef.current.getVideoTracks()[0]
           : localStreamRef.current.getVideoTracks()[0];
-
       const audioSource = localStreamRef.current.getAudioTracks()[0];
 
       if (videoSource) combinedStream.addTrack(videoSource);
@@ -641,7 +358,6 @@ export default function MeetingRoom() {
 
       setRecordingAlertMessage("Recording started");
       setShowRecordingAlert(true);
-      alert("🔴 Recording started!");
       setTimeout(() => setShowRecordingAlert(false), 3000);
 
       let seconds = 0;
@@ -707,8 +423,6 @@ export default function MeetingRoom() {
 
       setRecordingAlertMessage("Recording saved successfully");
       setShowRecordingAlert(true);
-      alert("✅ Recording saved and uploaded successfully!");
-
       setTimeout(() => setShowRecordingAlert(false), 3000);
     } catch (err) {
       console.error("Recording stop error:", err);
@@ -838,7 +552,6 @@ export default function MeetingRoom() {
 
   const connectToPeer = async (peerId) => {
     if (!peerRef.current || !localStreamRef.current) return;
-
     if (pendingPeerConnections.current.has(peerId)) return;
 
     pendingPeerConnections.current.add(peerId);
@@ -984,7 +697,6 @@ export default function MeetingRoom() {
     vid.playsInline = true;
     vid.className = "w-full h-full object-cover";
 
-    // Get display info for this participant
     const displayInfo = participantNames[id];
     if (displayInfo) {
       const label = document.createElement("div");
@@ -994,13 +706,11 @@ export default function MeetingRoom() {
       div.appendChild(label);
     }
 
-    // Speaking indicator
     const speakingIndicator = document.createElement("div");
     speakingIndicator.className =
       "absolute top-2 right-2 w-3 h-3 rounded-full bg-transparent";
     speakingIndicator.id = `speaking-${id}`;
 
-    // Add elements to DOM
     div.appendChild(vid);
     div.appendChild(speakingIndicator);
     remoteVideosRef.current[id] = div;
@@ -1008,7 +718,6 @@ export default function MeetingRoom() {
     const container = document.getElementById("remote-videos");
     if (container) container.appendChild(div);
 
-    // Update the UI periodically to reflect changes
     const updateLabel = () => {
       if (!isMountedRef.current) return;
 
@@ -1032,6 +741,7 @@ export default function MeetingRoom() {
 
     updateLabel();
   };
+
   const removeRemote = (id) => {
     const el = remoteVideosRef.current[id];
     if (el) {
@@ -1048,158 +758,375 @@ export default function MeetingRoom() {
     }
   };
 
-  // Replace your current loadMessagesAndReactions function with this:
-const loadMessagesAndReactions = useCallback(async () => {
-  try {
-    // Load existing messages
-    const { data: oldMsgs } = await supabase
-      .from("messages")
-      .select("*")
-      .eq("room_id", roomId)
-      .order("created_at", { ascending: true });
-    setMessages(oldMsgs || []);
+  const loadMessagesAndReactions = useCallback(async () => {
+    try {
+      // Load initial messages
+      const { data: messages } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+      setMessages(messages || []);
 
-    // Load existing reactions
-    const { data: oldReacts } = await supabase
-      .from("reactions")
-      .select("*")
-      .eq("room_id", roomId)
-      .order("created_at", { ascending: true });
-    setReactions(oldReacts || []);
+      // Load initial reactions
+      const { data: reactions } = await supabase
+        .from("reactions")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+      setReactions(reactions || []);
 
-    // Setup messages channel
-    subscribe('messages', {
-      channelName: `messages:${roomId}`,
-      options: {
-        event: "INSERT",
-        schema: "public",
-        table: "messages",
-        filter: `room_id=eq.${roomId}`,
-      },
-      onEvent: (payload) => {
-        setMessages(prev => {
-          const exists = prev.some(msg => msg.id === payload.new.id);
-          return exists ? prev : [...prev, payload.new];
-        });
-      }
-    });
-
-    // Setup reactions channel
-    subscribe('reactions', {
-      channelName: `reactions:${roomId}`,
-      options: {
-        event: "*",
-        schema: "public",
-        table: "reactions",
-        filter: `room_id=eq.${roomId}`,
-      },
-      onEvent: (payload) => {
-        if (payload.eventType === "INSERT") {
-          setReactions(prev => {
-            const exists = prev.some(react => react.id === payload.new.id);
+      // Setup real-time subscriptions
+      subscribe("messages", {
+        channelName: `messages:${roomId}`,
+        options: {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${roomId}`,
+        },
+        callback: (payload) => {
+          setMessages((prev) => {
+            const exists = prev.some(
+              (msg) =>
+                msg.id === payload.new.id ||
+                (msg.sender === payload.new.sender &&
+                  msg.text === payload.new.text &&
+                  msg.created_at === payload.new.created_at)
+            );
             return exists ? prev : [...prev, payload.new];
           });
-        } else if (payload.eventType === "DELETE") {
-          setReactions(prev => prev.filter(r => r.id !== payload.old.id));
-        }
-      }
-    });
+        },
+      });
 
-  } catch (error) {
-    console.error("Error loading messages and reactions:", error);
-  }
-}, [roomId, subscribe]);
+      subscribe("reactions", {
+        channelName: `reactions:${roomId}`,
+        options: {
+          event: "*",
+          schema: "public",
+          table: "reactions",
+          filter: `room_id=eq.${roomId}`,
+        },
+        callback: (payload) => {
+          if (payload.eventType === "INSERT") {
+            setReactions((prev) => {
+              const exists = prev.some(
+                (react) =>
+                  react.id === payload.new.id ||
+                  (react.user_id === payload.new.user_id &&
+                    react.emoji === payload.new.emoji &&
+                    react.created_at === payload.new.created_at)
+              );
+              return exists ? prev : [...prev, payload.new];
+            });
+          } else if (payload.eventType === "DELETE") {
+            setReactions((prev) => prev.filter((r) => r.id !== payload.old.id));
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Error loading messages and reactions:", error);
+    }
+  }, [roomId, subscribe]);
 
+  const sendMessage = async () => {
+    if (!chatInput.trim() || !user?.email || isSendingMessage) return;
 
- const sendMessage = async () => {
-  if (!chatInput.trim() || !user?.email || isSendingMessage) return;
+    setIsSendingMessage(true);
+    const tempId = Date.now().toString();
+    const tempMessage = {
+      id: tempId,
+      room_id: roomId,
+      sender: user.email,
+      text: chatInput,
+      created_at: new Date().toISOString(),
+      is_temp: true,
+    };
 
-  setIsSendingMessage(true);
-  const tempId = Date.now().toString();
-  const tempMessage = {
-    id: tempId,
-    room_id: roomId,
-    sender: user.email,
-    text: chatInput,
-    created_at: new Date().toISOString(),
-    is_temp: true
+    setMessages((prev) => [...prev, tempMessage]);
+    setChatInput("");
+
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .insert({
+          room_id: roomId,
+          sender: user.email,
+          text: chatInput,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      setMessages((prev) => prev.map((m) => (m.id === tempId ? data : m)));
+    } catch (error) {
+      console.error("Failed to send message:", error);
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
+    } finally {
+      setIsSendingMessage(false);
+    }
   };
-
-  // Optimistic update
-  setMessages(prev => [...prev, tempMessage]);
-  setChatInput('');
-
-  try {
-    const { data, error } = await supabase
-      .from("messages")
-      .insert({
-        room_id: roomId,
-        sender: user.email,
-        text: chatInput,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    // Replace temp message with persisted message
-    setMessages(prev => prev.map(m => 
-      m.id === tempId ? data : m
-    ));
-  } catch (error) {
-    console.error("Failed to send message:", error);
-    // Rollback optimistic update
-    setMessages(prev => prev.filter(m => m.id !== tempId));
-  } finally {
-    setIsSendingMessage(false);
-  }
-};
 
   const sendReaction = async (emoji) => {
-  if (!user?.id || !roomId) return;
-  if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
+    if (!user?.id || !roomId) return;
+    if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
 
-  const tempId = Date.now().toString();
-  const newReaction = {
-    id: tempId,
-    room_id: roomId,
-    user_id: user.id,
-    emoji,
-    created_at: new Date().toISOString(),
-  };
-
-  // Optimistic update
-  setReactions(prev => [...prev, newReaction]);
-
-  try {
-    const { error } = await supabase.from("reactions").insert({
+    const tempId = Date.now().toString();
+    const newReaction = {
+      id: tempId,
       room_id: roomId,
       user_id: user.id,
       emoji,
       created_at: new Date().toISOString(),
-    });
+    };
 
-    if (error) {
-      // Rollback if error occurs
-      setReactions(prev => prev.filter(r => r.id !== tempId));
-      throw error;
+    setReactions((prev) => [...prev, newReaction]);
+
+    try {
+      const { error } = await supabase.from("reactions").insert({
+        room_id: roomId,
+        user_id: user.id,
+        emoji,
+        created_at: new Date().toISOString(),
+      });
+
+      if (error) {
+        setReactions((prev) => prev.filter((r) => r.id !== tempId));
+        throw error;
+      }
+
+      await supabase.from("messages").insert({
+        room_id: roomId,
+        sender: "System",
+        text: `${user.email} reacted with ${emoji}`,
+        created_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("Error sending reaction:", error);
     }
+  };
 
-    // Add system message about reaction
-    await supabase.from("messages").insert({
-      room_id: roomId,
-      sender: "System",
-      text: `${user.email} reacted with ${emoji}`,
-      created_at: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error("Error sending reaction:", error);
-  }
-};
+  const updateParticipants = async (meetingId) => {
+    try {
+      const { data: participantsData, error: participantsError } =
+        await supabase
+          .from("participants")
+          .select("user_id, status, email, display_name")
+          .eq("meeting_id", meetingId)
+          .eq("status", "approved");
+
+      if (participantsError) throw participantsError;
+
+      const { data: signalsData, error: signalsError } = await supabase
+        .from("signals")
+        .select("peer_id, user_id")
+        .eq("room_id", roomId);
+
+      if (signalsError) throw signalsError;
+
+      if (participantsData && signalsData) {
+        setParticipants(participantsData);
+
+        const participantUserIds = participantsData.map((p) => p.user_id);
+        const signalUserIds = signalsData.map((s) => s.user_id);
+        const allUserIds = [
+          ...new Set([...participantUserIds, ...signalUserIds]),
+        ];
+
+        const { data: profilesData, error: profilesError } = await supabase
+          .from("profiles")
+          .select("id, email, name")
+          .in("id", allUserIds);
+
+        if (profilesError) throw profilesError;
+
+        const userInfoMap = {};
+        participantsData.forEach((p) => {
+          userInfoMap[p.user_id] = {
+            email: p.email || null,
+            displayName: p.display_name || null,
+          };
+        });
+
+        profilesData.forEach((profile) => {
+          if (!userInfoMap[profile.id] || !userInfoMap[profile.id].email) {
+            userInfoMap[profile.id] = {
+              email: profile.email || null,
+              displayName: profile.name || null,
+            };
+          }
+        });
+
+        const newPeerToUserIdMap = {};
+        signalsData.forEach((s) => {
+          newPeerToUserIdMap[s.peer_id] = s.user_id;
+        });
+        setPeerToUserIdMap(newPeerToUserIdMap);
+
+        const newParticipantNames = {};
+        signalsData.forEach((s) => {
+          const userInfo = userInfoMap[s.user_id];
+          if (userInfo) {
+            newParticipantNames[s.peer_id] =
+              userInfo.displayName ||
+              userInfo.email ||
+              `User ${s.user_id.slice(0, 4)}`;
+          }
+        });
+        setParticipantNames(newParticipantNames);
+
+        Object.keys(remoteVideosRef.current).forEach((peerId) => {
+          const videoDiv = remoteVideosRef.current[peerId];
+          if (videoDiv) {
+            const label = videoDiv.querySelector(".participant-label");
+            if (label && newParticipantNames[peerId]) {
+              label.textContent = newParticipantNames[peerId];
+            }
+          }
+        });
+      }
+    } catch (error) {
+      console.error("Error updating participants:", error);
+    }
+  };
+
+  const updateWaitingList = async (meetingId) => {
+    try {
+      const { data, error } = await supabase
+        .from("participants")
+        .select("id, user_id, email, status, created_at")
+        .eq("meeting_id", meetingId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: true });
+
+      if (error) throw error;
+      setWaitingList(data || []);
+    } catch (error) {
+      console.error("Error fetching waiting list:", error);
+      setWaitingList([]);
+    }
+  };
+
+  const setupWaitingListener = useCallback(
+    (mtId) => {
+      updateWaitingList(mtId);
+
+      subscribe("waiting", {
+        channelName: `waiting:${mtId}`,
+        options: {
+          event: "*",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${mtId}`,
+        },
+        callback: () => updateWaitingList(mtId),
+      });
+    },
+    [subscribe]
+  );
+
+  const setupParticipantListener = useCallback(
+    (mtId, uid) => {
+      subscribe(`participant:${mtId}:${uid}`, {
+        channelName: `participant:${mtId}:${uid}`,
+        options: {
+          event: "UPDATE",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
+        },
+        callback: async (payload) => {
+          if (payload.new.status === "approved") {
+            setWaitingForApproval(false);
+            setPermitToJoin(true);
+
+            try {
+              if (!localStreamRef.current) {
+                await requestMediaPermissions();
+              }
+
+              if (!peerRef.current) {
+                const peer = createPeer(user.id);
+                peerRef.current = peer;
+
+                peer.on("open", async (id) => {
+                  await supabase.from("signals").upsert({
+                    room_id: roomId,
+                    peer_id: id,
+                    user_id: user.id,
+                    last_active: new Date().toISOString(),
+                  });
+
+                  const { data: others } = await supabase
+                    .from("signals")
+                    .select("peer_id")
+                    .eq("room_id", roomId)
+                    .neq("peer_id", id);
+
+                  if (others?.length > 0) {
+                    others.forEach(({ peer_id }) => connectToPeer(peer_id));
+                  }
+                });
+
+                peer.on("call", (call) => {
+                  call.answer(localStreamRef.current);
+                  setupCall(call, call.peer);
+                });
+              }
+
+              await updateParticipants(mtId);
+              setConnectionStatus("Connected to meeting");
+            } catch (error) {
+              console.error("Approval handling error:", error);
+              setConnectionStatus("Connection failed - retrying...");
+              setTimeout(() => setupParticipantListener(mtId, uid), 3000);
+            }
+          }
+        },
+      });
+    },
+    [roomId, user?.id, subscribe]
+  );
+
+  const ensureProfileExists = async (userId) => {
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser();
+    if (authError) throw authError;
+
+    const { error } = await supabase
+      .from("profiles")
+      .upsert({ id: userId, email: user.email }, { onConflict: "id" });
+
+    if (error) throw error;
+  };
+
+  const createPendingRequest = async (meetingId, userId) => {
+    try {
+      await ensureProfileExists(userId);
+
+      const { error } = await supabase.from("participants").upsert(
+        {
+          meeting_id: meetingId,
+          user_id: userId,
+          status: "pending",
+          created_at: new Date().toISOString(),
+        },
+        { onConflict: "meeting_id,user_id" }
+      );
+
+      if (error) throw error;
+      setWaitingForApproval(true);
+    } catch (error) {
+      console.error("Error in createPendingRequest:", error);
+      alert("Failed to create join request. Please try again.");
+    }
+  };
 
   const approveUser = async (uid) => {
     try {
-      // First get the user's email from profiles
       const { data: userProfile } = await supabase
         .from("profiles")
         .select("email")
@@ -1210,15 +1137,13 @@ const loadMessagesAndReactions = useCallback(async () => {
         .from("participants")
         .update({
           status: "approved",
-          email: userProfile?.email, // Store the email in participants table
+          email: userProfile?.email,
           updated_at: new Date().toISOString(),
         })
         .eq("meeting_id", meetingDbId)
         .eq("user_id", uid);
 
       if (updateError) throw updateError;
-
-      // Rest of the approval logic...
     } catch (error) {
       console.error("Error approving user:", error);
       alert("Failed to approve user. Please try again.");
@@ -1243,384 +1168,85 @@ const loadMessagesAndReactions = useCallback(async () => {
     }
   };
 
-  const leaveRoom = async () => {
-    if (!isMountedRef.current) return;
+ const leaveRoom = async () => {
+  if (!isMountedRef.current) return;
 
-    try {
-      if (isRecording) await stopRecording();
-
-      if (isScreenSharing && screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((track) => track.stop());
-        screenStreamRef.current = null;
-        setIsScreenSharing(false);
-      }
-
-      if (screenShareContainerRef.current) {
-        screenShareContainerRef.current.remove();
-        screenShareContainerRef.current = null;
-      }
-
-      if (peerRef.current?.id) {
-        await supabase
-          .from("signals")
-          .delete()
-          .eq("room_id", roomId)
-          .eq("peer_id", peerRef.current.id);
-      }
-
-      if (peerRef.current) {
-        peerRef.current.destroy();
-        peerRef.current = null;
-      }
-
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => track.stop());
-        localStreamRef.current = null;
-      }
-
-      Object.values(remoteVideosRef.current).forEach((el) => el.remove());
-      remoteVideosRef.current = {};
-
-      if (refreshInterval.current) {
-        clearInterval(refreshInterval.current);
-        refreshInterval.current = null;
-      }
-
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-        recordingTimerRef.current = null;
-      }
-
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-
-      if (participantUpdateTimeoutRef.current) {
-        clearTimeout(participantUpdateTimeoutRef.current);
-        participantUpdateTimeoutRef.current = null;
-      }
-
-      if (autoRefreshIntervalRef.current) {
-        clearInterval(autoRefreshIntervalRef.current);
-        autoRefreshIntervalRef.current = null;
-      }
-
-      if (meetingDbId && user?.id) {
-        await supabase
-          .from("participants")
-          .delete()
-          .eq("meeting_id", meetingDbId)
-          .eq("user_id", user.id);
-      }
-
-      await cleanupSubscriptions();
-
-      setIsInitialized(false);
-      setPermitToJoin(false);
-      setWaitingForApproval(false);
-
-      navigate("/");
-    } catch (err) {
-      console.warn("Leave room error:", err);
-      navigate("/");
-    }
-  };
-
-  const setupRealTimeChannels = useCallback(() => {
-    // Clean up existing channels first
-    cleanupSubscriptions();
-
-    // Only create new channels if they don't exist or are closed
-    if (
-      !messagesChannel.current ||
-      messagesChannel.current.state !== "joined"
-    ) {
-      messagesChannel.current = supabase
-        .channel(`messages:${roomId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "INSERT",
-            schema: "public",
-            table: "messages",
-            filter: `room_id=eq.${roomId}`,
-          },
-          (payload) => {
-            setMessages((prev) => {
-              const exists = prev.some((msg) => msg.id === payload.new.id);
-              return exists ? prev : [...prev, payload.new];
-            });
-          }
-        )
-        .subscribe((status, err) => {
-          if (err) {
-            console.error("Messages channel subscription error:", err);
-            setTimeout(setupRealTimeChannels, 2000);
-          }
-        });
-    }
-
-    if (
-      !reactionsChannel.current ||
-      reactionsChannel.current.state !== "joined"
-    ) {
-      reactionsChannel.current = supabase
-        .channel(`reactions:${roomId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "reactions",
-            filter: `room_id=eq.${roomId}`,
-          },
-          (payload) => {
-            if (payload.eventType === "INSERT") {
-              setReactions((prev) => {
-                const exists = prev.some(
-                  (react) => react.id === payload.new.id
-                );
-                return exists ? prev : [...prev, payload.new];
-              });
-            } else if (payload.eventType === "DELETE") {
-              setReactions((prev) =>
-                prev.filter((r) => r.id !== payload.old.id)
-              );
-            }
-          }
-        )
-        .subscribe((status, err) => {
-          if (err) {
-            console.error("Reactions channel subscription error:", err);
-            setTimeout(setupRealTimeChannels, 2000);
-          }
-        });
-    }
-
-    if (
-      !participantsChannel.current ||
-      participantsChannel.current.state !== "joined"
-    ) {
-      participantsChannel.current = supabase
-        .channel(`participants:${meetingDbId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${meetingDbId}`,
-          },
-          () => {
-            updateParticipants(meetingDbId);
-          }
-        )
-        .subscribe((status, err) => {
-          if (err) {
-            console.error("Participants channel subscription error:", err);
-            setTimeout(setupRealTimeChannels, 2000);
-          }
-        });
-    }
-  }, [roomId, meetingDbId]);
-
-  // Create a channel manager to handle all real-time subscriptions
-  const useChannelManager = () => {
-    const channels = useRef({});
-
-    const subscribe = (name, config) => {
-      if (channels.current[name] && channels.current[name].state === "joined") {
-        return channels.current[name];
-      }
-
-      // Clean up existing channel if present
-      if (channels.current[name]) {
-        supabase.removeChannel(channels.current[name]);
-      }
-
-      const channel = supabase
-        .channel(config.channelName)
-        .on("postgres_changes", config.options, config.callback)
-        .subscribe((status, err) => {
-          if (err) {
-            console.error(`${name} channel error:`, err);
-            setTimeout(() => subscribe(name, config), 2000);
-          }
-        });
-
-      channels.current[name] = channel;
-      return channel;
-    };
-
-    const unsubscribe = (name) => {
-      if (channels.current[name]) {
-        supabase.removeChannel(channels.current[name]);
-        delete channels.current[name];
-      }
-    };
-
-    const unsubscribeAll = () => {
-      Object.keys(channels.current).forEach(unsubscribe);
-    };
-
-    return { subscribe, unsubscribe, unsubscribeAll };
-  };
-
-  const MessageHandler = () => {
-    const [messages, setMessages] = useState([]);
-    const { subscribe, unsubscribe } = useChannelManager();
-
-    useEffect(() => {
-      // Initial load
-      const loadMessages = async () => {
-        const { data } = await supabase
-          .from("messages")
-          .select("*")
-          .eq("room_id", roomId)
-          .order("created_at", { ascending: true });
-        setMessages(data || []);
-      };
-
-      loadMessages();
-
-      // Real-time subscription
-      const messagesChannel = subscribe("messages", {
-        channelName: `messages:${roomId}`,
-        options: {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${roomId}`,
-        },
-        callback: (payload) => {
-          setMessages((prev) => {
-            // Deduplicate messages
-            const exists = prev.some((msg) => msg.id === payload.new.id);
-            return exists ? prev : [...prev, payload.new];
-          });
-        },
-      });
-
-      return () => {
-        unsubscribe("messages");
-      };
-    }, [roomId]);
-  };
-
-  const cleanupSubscriptions = useCallback(async () => {
   try {
-    unsubscribeAll();
-  } catch (error) {
-    console.warn("Error cleaning up subscriptions:", error);
-  }
-}, [unsubscribeAll]);
+    if (isRecording) await stopRecording();
 
-  // Add this state
-  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
-
-  // Enhanced approval handling
-  useEffect(() => {
-    if (!waitingForApproval || !meetingDbId || !user?.id) return;
-
-    // Real-time listener (primary method)
-    const listener = supabase
-      .channel(`approval:${meetingDbId}:${user.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "participants",
-          filter: `meeting_id=eq.${meetingDbId},user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          if (payload.new.status === "approved") {
-            handleApproval();
-          }
-        }
-      )
-      .subscribe();
-
-    // Polling fallback
-    const interval = setInterval(async () => {
-      try {
-        const { data } = await supabase
-          .from("participants")
-          .select("status")
-          .eq("meeting_id", meetingDbId)
-          .eq("user_id", user.id)
-          .single();
-
-        if (data?.status === "approved") {
-          handleApproval();
-          clearInterval(interval);
-        } else {
-          setApprovalCheckCount((prev) => prev + 1);
-        }
-      } catch (error) {
-        console.error("Approval check error:", error);
-      }
-    }, 10000); // Check every 10 seconds
-
-    const handleApproval = () => {
-      setWaitingForApproval(false);
-      setPermitToJoin(true);
-      clearInterval(interval);
-      supabase.removeChannel(listener);
-
-      // Initialize meeting connection
-      initializeAfterApproval();
-    };
-
-    return () => {
-      clearInterval(interval);
-      supabase.removeChannel(listener);
-    };
-  }, [waitingForApproval, meetingDbId, user?.id]);
-
-  const initializeAfterApproval = async () => {
-    try {
-      await requestMediaPermissions();
-
-      if (!peerRef.current) {
-        const peer = createPeer(user.id);
-        peerRef.current = peer;
-
-        peer.on("open", async (id) => {
-          await supabase.from("signals").upsert({
-            room_id: roomId,
-            peer_id: id,
-            user_id: user.id,
-            last_active: new Date().toISOString(),
-          });
-
-          // Connect to existing participants
-          const { data: others } = await supabase
-            .from("signals")
-            .select("peer_id")
-            .eq("room_id", roomId)
-            .neq("peer_id", id);
-
-          if (others?.length > 0) {
-            others.forEach(({ peer_id }) => connectToPeer(peer_id));
-          }
-        });
-
-        peer.on("call", (call) => {
-          call.answer(localStreamRef.current);
-          setupCall(call, call.peer);
-        });
-      }
-
-      await updateParticipants(meetingDbId);
-      setConnectionStatus("Connected to meeting");
-    } catch (error) {
-      console.error("Post-approval initialization error:", error);
-      setConnectionStatus("Connection failed - retrying...");
-      setTimeout(initializeAfterApproval, 3000);
+    if (isScreenSharing && screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+      setIsScreenSharing(false);
     }
-  };
+
+    if (screenShareContainerRef.current) {
+      screenShareContainerRef.current.remove();
+      screenShareContainerRef.current = null;
+    }
+
+    if (peerRef.current?.id) {
+      await supabase
+        .from("signals")
+        .delete()
+        .eq("room_id", roomId)
+        .eq("peer_id", peerRef.current.id);
+    }
+
+    if (peerRef.current) {
+      peerRef.current.destroy();
+      peerRef.current = null;
+    }
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+
+    Object.values(remoteVideosRef.current).forEach((el) => el.remove());
+    remoteVideosRef.current = {};
+
+    // Replace this block
+    if (autoRefreshIntervalRef.current) {
+      clearInterval(autoRefreshIntervalRef.current);
+      autoRefreshIntervalRef.current = null;
+    }
+
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
+    if (participantUpdateTimeoutRef.current) {
+      clearTimeout(participantUpdateTimeoutRef.current);
+      participantUpdateTimeoutRef.current = null;
+    }
+
+    if (meetingDbId && user?.id) {
+      await supabase
+        .from("participants")
+        .delete()
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", user.id);
+    }
+
+    await unsubscribeAll();
+
+    setIsInitialized(false);
+    setPermitToJoin(false);
+    setWaitingForApproval(false);
+
+    navigate("/");
+  } catch (err) {
+    console.warn("Leave room error:", err);
+    navigate("/");
+  }
+};
 
   const joinMeeting = useCallback(
     async (meetingId, userId) => {
@@ -1697,42 +1323,29 @@ const loadMessagesAndReactions = useCallback(async () => {
               }
             }
 
-            if (!signalsChannel.current) {
-              signalsChannel.current = supabase
-                .channel(`signals:${roomId}`)
-                .on(
-                  "postgres_changes",
-                  {
-                    event: "*",
-                    schema: "public",
-                    table: "signals",
-                    filter: `room_id=eq.${roomId}`,
-                  },
-                  (payload) => {
-                    if (payload.new.peer_id !== pid) {
-                      if (
-                        payload.eventType === "INSERT" ||
-                        payload.eventType === "UPDATE"
-                      ) {
-                        if (!peerConnectionsRef.current[payload.new.peer_id]) {
-                          connectToPeer(payload.new.peer_id);
-                        }
-                      } else if (payload.eventType === "DELETE") {
-                        removeRemote(payload.old.peer_id);
-                      }
+            subscribe("signals", {
+              channelName: `signals:${roomId}`,
+              options: {
+                event: "*",
+                schema: "public",
+                table: "signals",
+                filter: `room_id=eq.${roomId}`,
+              },
+              callback: (payload) => {
+                if (payload.new.peer_id !== pid) {
+                  if (
+                    payload.eventType === "INSERT" ||
+                    payload.eventType === "UPDATE"
+                  ) {
+                    if (!peerConnectionsRef.current[payload.new.peer_id]) {
+                      connectToPeer(payload.new.peer_id);
                     }
+                  } else if (payload.eventType === "DELETE") {
+                    removeRemote(payload.old.peer_id);
                   }
-                )
-                .subscribe((status, err) => {
-                  if (err) {
-                    setTimeout(() => {
-                      if (signalsChannel.current) {
-                        signalsChannel.current.subscribe();
-                      }
-                    }, 2000);
-                  }
-                });
-            }
+                }
+              },
+            });
           } catch (err) {
             console.error("Error in peer open handler:", err);
             setTimeout(() => {
@@ -1777,55 +1390,31 @@ const loadMessagesAndReactions = useCallback(async () => {
         setTimeout(() => joinMeeting(meetingId, userId), 5000);
       }
     },
-    [isJoining, isScreenSharing, roomId, user?.email]
+    [isJoining, isScreenSharing, roomId, user?.email, subscribe]
   );
 
-  const setupParticipantsListener = useCallback((mtId) => {
-    if (!participantsChannel.current) {
-      participantsChannel.current = supabase
-        .channel(`participants:${mtId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId}`,
-          },
-          (payload) => {
-            if (participantUpdateTimeoutRef.current) {
-              clearTimeout(participantUpdateTimeoutRef.current);
-            }
-            participantUpdateTimeoutRef.current = setTimeout(() => {
-              updateParticipants(mtId);
-            }, 500);
+  const setupParticipantsListener = useCallback(
+    (mtId) => {
+      subscribe("participants", {
+        channelName: `participants:${mtId}`,
+        options: {
+          event: "*",
+          schema: "public",
+          table: "participants",
+          filter: `meeting_id=eq.${mtId}`,
+        },
+        callback: (payload) => {
+          if (participantUpdateTimeoutRef.current) {
+            clearTimeout(participantUpdateTimeoutRef.current);
           }
-        )
-        .subscribe();
-    }
-  }, []);
-
-  // Add this function
-  const setupApprovalEventSource = useCallback((meetingId, userId) => {
-    const eventSource = new EventSource(
-      `/api/approval-events?meeting=${meetingId}&user=${userId}`
-    );
-
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.status === "approved") {
-        setWaitingForApproval(false);
-        setPermitToJoin(true);
-        eventSource.close();
-      }
-    };
-
-    eventSource.onerror = () => {
-      setTimeout(() => setupApprovalEventSource(meetingId, userId), 5000);
-    };
-
-    return () => eventSource.close();
-  }, []);
+          participantUpdateTimeoutRef.current = setTimeout(() => {
+            updateParticipants(mtId);
+          }, 500);
+        },
+      });
+    },
+    [subscribe]
+  );
 
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
@@ -1943,12 +1532,40 @@ const loadMessagesAndReactions = useCallback(async () => {
     setupParticipantListener,
     setupParticipantsListener,
     setupWaitingListener,
+    loadMessagesAndReactions,
+    joinMeeting,
   ]);
 
   useEffect(() => {
     const pass = new URLSearchParams(search).get("passcode") || "";
     setInputPasscode(pass);
   }, [search]);
+
+  useEffect(() => {
+    const checkIfMobile = () => {
+      setIsMobile(
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+          navigator.userAgent
+        )
+      );
+    };
+    checkIfMobile();
+  }, []);
+
+  useEffect(() => {
+    if (permitToJoin && !autoRefreshIntervalRef.current) {
+      autoRefreshIntervalRef.current = setInterval(() => {
+        refreshMeetingState();
+      }, AUTO_REFRESH_INTERVAL);
+    }
+
+    return () => {
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+    };
+  }, [permitToJoin, refreshMeetingState]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -1971,9 +1588,8 @@ const loadMessagesAndReactions = useCallback(async () => {
         screenShareContainerRef.current = null;
       }
     };
-  }, [needPasscode, initRoom, leaveRoom, isInitialized]);
+  }, [needPasscode, initRoom]);
 
-  // Add to your useEffect hooks
   useEffect(() => {
     if (waitingForApproval && !permitToJoin) {
       const approvalCheckInterval = setInterval(async () => {
@@ -1989,12 +1605,11 @@ const loadMessagesAndReactions = useCallback(async () => {
             setWaitingForApproval(false);
             setPermitToJoin(true);
             clearInterval(approvalCheckInterval);
-            window.location.reload(); // Last resort if other methods fail
           }
         } catch (error) {
           console.error("Approval check error:", error);
         }
-      }, 5000); // Check every 5 seconds
+      }, 5000);
 
       return () => clearInterval(approvalCheckInterval);
     }
@@ -2002,124 +1617,71 @@ const loadMessagesAndReactions = useCallback(async () => {
 
   useEffect(() => {
     if (permitToJoin && roomId && meetingDbId) {
-      // Only setup channels if they don't exist or are closed
-      if (
-        !messagesChannel.current ||
-        messagesChannel.current.state !== "joined" ||
-        !reactionsChannel.current ||
-        reactionsChannel.current.state !== "joined"
-      ) {
-        setupRealTimeChannels();
-      }
       loadMessagesAndReactions();
     }
 
     return () => {
-      cleanupSubscriptions();
+      unsubscribeAll();
     };
-  }, [permitToJoin, roomId, meetingDbId, setupRealTimeChannels]);
+  }, [
+    permitToJoin,
+    roomId,
+    meetingDbId,
+    loadMessagesAndReactions,
+    unsubscribeAll,
+  ]);
 
   useEffect(() => {
-    const checkConnection = async () => {
-      if (!messagesChannel.current || !reactionsChannel.current) return;
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
-      const messagesStatus = messagesChannel.current.state;
-      const reactionsStatus = reactionsChannel.current.state;
+  useEffect(() => {
+    if (!permitToJoin) return;
 
-      if (messagesStatus === "joined" && reactionsStatus === "joined") {
-        setConnectionStatus("Connected");
-      } else {
-        setConnectionStatus("Reconnecting...");
-        // Only attempt to reconnect if channels are not in the process of joining
-        if (messagesStatus !== "joining" && reactionsStatus !== "joining") {
-          setupRealTimeChannels();
+    const messagePolling = setInterval(async () => {
+      if (document.visibilityState === "visible") {
+        const { data } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("room_id", roomId)
+          .order("created_at", { descending: true })
+          .limit(1);
+
+        if (data?.[0]) {
+          setMessages((prev) => {
+            const exists = prev.some((m) => m.id === data[0].id);
+            return exists ? prev : [...prev, data[0]];
+          });
         }
       }
+    }, 30000);
+
+    return () => clearInterval(messagePolling);
+  }, [roomId, permitToJoin]);
+
+  useEffect(() => {
+    const checkConnection = () => {
+      const channels = Object.values(channelsRef.current);
+      const allConnected = channels.every(
+        (ch) => ch && (ch.state === "joined" || ch.state === "joining")
+      );
+      setIsConnected(allConnected);
+      setConnectionStatus(allConnected ? "Connected" : "Reconnecting...");
     };
 
     const interval = setInterval(checkConnection, 5000);
     return () => clearInterval(interval);
-  }, [setupRealTimeChannels]);
+  }, []);
 
   useEffect(() => {
-    if (!permitToJoin || !meetingDbId) return;
+    if (!isConnected && permitToJoin) {
+      const timer = setTimeout(() => {
+        loadMessagesAndReactions();
+      }, 3000);
 
-    const loadInitialMessages = async () => {
-      const { data, error } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-
-      if (!error) setMessages(data || []);
-    };
-
-    loadInitialMessages();
-
-    const channel = supabase
-      .channel(`room:${roomId}:messages`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload) => {
-          setMessages((prev) => {
-            // Deduplicate messages
-            if (prev.some((m) => m.id === payload.new.id)) return prev;
-            return [...prev, payload.new];
-          });
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [roomId, permitToJoin, meetingDbId]);
-
-  useEffect(() => {
-  messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-}, [messages]);
-
-
-  useEffect(() => {
-  if (permitToJoin && roomId && meetingDbId) {
-    loadMessagesAndReactions();
-  }
-
-  return () => {
-    cleanupSubscriptions();
-  };
-}, [permitToJoin, roomId, meetingDbId, loadMessagesAndReactions, cleanupSubscriptions]);
-
-useEffect(() => {
-  if (!permitToJoin) return;
-
-  // Fallback polling for messages when real-time fails
-  const messagePolling = setInterval(async () => {
-    if (document.visibilityState === 'visible') {
-      const { data } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('room_id', roomId)
-        .order('created_at', { descending: true })
-        .limit(1);
-      
-      if (data?.[0]) {
-        setMessages(prev => {
-          const exists = prev.some(m => m.id === data[0].id);
-          return exists ? prev : [...prev, data[0]];
-        });
-      }
+      return () => clearTimeout(timer);
     }
-  }, 30000); // 30 seconds as fallback
-
-  return () => clearInterval(messagePolling);
-}, [roomId, permitToJoin]);
+  }, [isConnected, permitToJoin, loadMessagesAndReactions]);
 
   if (needPasscode) {
     return (
@@ -2282,7 +1844,10 @@ useEffect(() => {
             <span className="text-sm">{connectionStatus}</span>
             {connectionStatus !== "Connected" && (
               <button
-                onClick={setupRealTimeChannels}
+                onClick={() => {
+                  loadMessagesAndReactions();
+                  refreshMeetingState();
+                }}
                 className="text-sm bg-gray-100 px-2 py-1 rounded hover:bg-gray-200"
               >
                 Reconnect
@@ -2300,18 +1865,19 @@ useEffect(() => {
               <div className="space-y-2 max-h-60 overflow-y-auto">
                 {participants.map((participant) => (
                   <div
-                    key={participant.id}
+                    key={participant.user_id}
                     className="flex items-center p-2 bg-gray-50 rounded hover:bg-gray-100"
                   >
                     <span className="text-sm truncate flex items-center">
-                      {participant.email}
-                      {participant.id === user?.id && (
+                      {participant.email ||
+                        `User ${participant.user_id.slice(0, 4)}`}
+                      {participant.user_id === user?.id && (
                         <span className="ml-2 text-xs text-gray-500">
                           (You)
                         </span>
                       )}
                     </span>
-                    {activeSpeakers[participant.id] && (
+                    {activeSpeakers[participant.user_id] && (
                       <span className="ml-2 w-2 h-2 rounded-full bg-green-500"></span>
                     )}
                   </div>
@@ -2433,7 +1999,7 @@ useEffect(() => {
             <div className="p-3 h-60 overflow-y-auto space-y-2">
               {messages.map((message) => (
                 <div
-                  key={message.id}
+                  key={`${message.id}-${message.created_at}`}
                   className={`flex ${
                     message.sender === user.email
                       ? "justify-end"
