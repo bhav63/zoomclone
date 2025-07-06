@@ -8,9 +8,16 @@ const getStablePeerId = (userId) => {
   const storedId = sessionStorage.getItem(`peerId-${userId}`);
   if (storedId) return storedId;
 
+
   const newId = `peer-${userId}-${Math.random().toString(36).substr(2, 9)}`;
   sessionStorage.setItem(`peerId-${userId}`, newId);
   return newId;
+};
+
+const formatTime = (seconds) => {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 };
 
 const AUTO_REFRESH_INTERVAL = 1000;
@@ -103,7 +110,7 @@ export default function MeetingRoom() {
     }
   }, [messages, hasNewMessages, isAtBottom]);
 
-  
+
 
   // Improved real-time message handling
   const setupRealTimeMessages = useCallback(() => {
@@ -737,112 +744,147 @@ export default function MeetingRoom() {
   };
 
   const startRecording = async () => {
-    if (!localStreamRef.current) {
-      alert("Please join the meeting first to start recording.");
-      return;
+  if (!localStreamRef.current) {
+    alert("Please join the meeting first to start recording.");
+    return;
+  }
+
+  try {
+    // Request screen sharing with audio (system audio)
+    const screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true, // This captures system audio in supported browsers
+    });
+
+    // Create a combined stream with screen, camera, and microphone
+    const combinedStream = new MediaStream();
+
+    // Add screen video and audio tracks
+    screenStream.getVideoTracks().forEach(track => combinedStream.addTrack(track));
+    screenStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
+
+    // Add local camera and microphone if enabled
+    if (cameraOn) {
+      localStreamRef.current.getVideoTracks().forEach(track => {
+        combinedStream.addTrack(track);
+      });
     }
-    try {
-      const combinedStream = new MediaStream();
+    if (!isMuted) {
+      localStreamRef.current.getAudioTracks().forEach(track => {
+        combinedStream.addTrack(track);
+      });
+    }
 
-      const videoSource =
-        isScreenSharing && screenStreamRef.current
-          ? screenStreamRef.current.getVideoTracks()[0]
-          : localStreamRef.current.getVideoTracks()[0];
+    // Initialize recorder with the combined stream
+    const recorder = new RecordRTC(combinedStream, {
+      type: 'video',
+      mimeType: 'video/webm;codecs=vp9,opus',
+      bitsPerSecond: 2500000, // Higher quality
+      videoBitsPerSecond: 2000000,
+      audioBitsPerSecond: 128000,
+      frameRate: isMobile ? 15 : 30,
+      recorderType: RecordRTC.MediaStreamRecorder,
+      disableLogs: true,
+      timeSlice: 1000, // Save every second
+      ondataavailable: (blob) => {
+        // Handle chunks if needed
+      }
+    });
 
-      const audioSource = localStreamRef.current.getAudioTracks()[0];
+    recorder.startRecording();
+    recorderRef.current = recorder;
+    screenStreamRef.current = screenStream; // Store for cleanup
+    setIsRecording(true);
 
-      if (videoSource) combinedStream.addTrack(videoSource);
-      if (audioSource) combinedStream.addTrack(audioSource);
+    // Handle when screen sharing is stopped
+    screenStream.getVideoTracks()[0].onended = () => {
+      stopRecording();
+    };
 
-      const recorder = new RecordRTC(combinedStream, {
-        type: "video",
-        mimeType: "video/webm;codecs=vp9",
-        bitsPerSecond: 1280000,
-        videoBitsPerSecond: 1000000,
-        audioBitsPerSecond: 128000,
+    setRecordingAlertMessage("Recording started");
+    setShowRecordingAlert(true);
+    alert("🔴 Recording started! (Screen + Audio + Video)");
+
+    let seconds = 0;
+    recordingTimerRef.current = setInterval(() => {
+      seconds++;
+      setRecordingAlertMessage(`Recording (${formatTime(seconds)})`);
+    }, 1000);
+
+  } catch (err) {
+    console.error("Recording start error:", err);
+    alert(`Failed to start recording: ${err.message}`);
+  }
+};
+
+const stopRecording = async () => {
+  if (!recorderRef.current) return;
+  
+  try {
+    clearInterval(recordingTimerRef.current);
+
+    // Stop all tracks
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+
+    // Get the final recording blob
+    const blob = await new Promise((resolve) => {
+      recorderRef.current.stopRecording(() => {
+        resolve(recorderRef.current.getBlob());
+      });
+    });
+
+    if (!blob || blob.size === 0) {
+      throw new Error("Recording produced empty file");
+    }
+
+    // Generate filename with timestamp
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `recording-${roomId}-${timestamp}.webm`;
+
+    // Upload to Supabase storage
+    const { data, error } = await supabase.storage
+      .from("recordings")
+      .upload(`public/${filename}`, blob, {
+        contentType: "video/webm",
+        upsert: false,
+        cacheControl: '3600'
       });
 
-      recorder.startRecording();
-      recorderRef.current = recorder;
-      setIsRecording(true);
+    if (error) throw error;
 
-      setRecordingAlertMessage("Recording started");
-      setShowRecordingAlert(true);
-      setTimeout(() => setShowRecordingAlert(false), 3000);
+    // Get public URL
+    const { data: { publicUrl } } = await supabase.storage
+      .from("recordings")
+      .getPublicUrl(`public/${filename}`);
 
-      let seconds = 0;
-      recordingTimerRef.current = setInterval(() => {
-        seconds++;
-        setRecordingAlertMessage(`Recording (${formatTime(seconds)})`);
-      }, 1000);
-    } catch (err) {
-      console.error("Recording start error:", err);
-      alert("Failed to start recording.");
-    }
-  };
+    // Save recording metadata to database
+    const { data: userData } = await supabase.auth.getUser();
+    await supabase.from("recordings").insert({
+      room_id: roomId,
+      uploaded_by: userData.user.id,
+      file_name: filename,
+      file_url: publicUrl,
+      file_size: blob.size,
+      duration: Math.floor(recorderRef.current.getBlob().duration),
+      created_at: new Date().toISOString(),
+      recording_type: "screen_with_audio"
+    });
 
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs
-      .toString()
-      .padStart(2, "0")}`;
-  };
+    alert("✅ Recording saved and uploaded successfully!");
+    setIsRecording(false);
+    recorderRef.current = null;
+    screenStreamRef.current = null;
 
-  const stopRecording = async () => {
-    if (!recorderRef.current) return;
-    try {
-      clearInterval(recordingTimerRef.current);
-
-      await new Promise((resolve) => {
-        recorderRef.current.stopRecording(resolve);
-      });
-
-      const blob = recorderRef.current.getBlob();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const filename = `recording-${roomId}-${timestamp}.webm`;
-
-      const { data, error } = await supabase.storage
-        .from("recordings")
-        .upload(`public/${filename}`, blob, {
-          contentType: "video/webm",
-          upsert: false,
-        });
-
-      if (error) throw error;
-
-      const {
-        data: { publicUrl },
-      } = supabase.storage
-        .from("recordings")
-        .getPublicUrl(`public/${filename}`);
-
-      const { data: userData } = await supabase.auth.getUser();
-      await supabase.from("recordings").insert({
-        room_id: roomId,
-        uploaded_by: userData.user.id,
-        file_name: filename,
-        file_url: publicUrl,
-        file_size: blob.size,
-        duration: Math.floor(recorderRef.current.getBlob().duration),
-        created_at: new Date().toISOString(),
-      });
-
-      setIsRecording(false);
-      recorderRef.current = null;
-
-      setRecordingAlertMessage("Recording saved successfully");
-      setShowRecordingAlert(true);
-      setTimeout(() => setShowRecordingAlert(false), 3000);
-    } catch (err) {
-      console.error("Recording stop error:", err);
-      setIsRecording(false);
-      recorderRef.current = null;
-      setRecordingAlertMessage("Failed to save recording");
-      setShowRecordingAlert(true);
-      setTimeout(() => setShowRecordingAlert(false), 3000);
-    }
-  };
+  } catch (err) {
+    console.error("Recording stop error:", err);
+    alert(`Failed to save recording: ${err.message}`);
+    setIsRecording(false);
+    recorderRef.current = null;
+    screenStreamRef.current = null;
+  }
+};
 
   const createPeer = (userId) => {
     const peerId = getStablePeerId(userId);
