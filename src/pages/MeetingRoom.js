@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation } from "react-router-dom";
 import Peer from "peerjs";
 import RecordRTC from "recordrtc";
 import { supabase } from "../supabaseClient";
+import useSupabaseChannels from '../hooks/useSupabaseChannels';
 
 const getStablePeerId = (userId) => {
   const storedId = sessionStorage.getItem(`peerId-${userId}`);
@@ -23,7 +24,7 @@ export default function MeetingRoom() {
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
   const [waitingList, setWaitingList] = useState([]);
-
+  const { subscribe, unsubscribeAll } = useSupabaseChannels();
   const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
 
   const [participants, setParticipants] = useState([]);
@@ -1047,124 +1048,88 @@ export default function MeetingRoom() {
     }
   };
 
-  const loadMessagesAndReactions = async () => {
-    try {
-      // Load existing messages
-      const { data: oldMsgs } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-      setMessages(oldMsgs || []);
+  // Replace your current loadMessagesAndReactions function with this:
+const loadMessagesAndReactions = useCallback(async () => {
+  try {
+    // Load existing messages
+    const { data: oldMsgs } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("room_id", roomId)
+      .order("created_at", { ascending: true });
+    setMessages(oldMsgs || []);
 
-      // Load existing reactions
-      const { data: oldReacts } = await supabase
-        .from("reactions")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-      setReactions(oldReacts || []);
+    // Load existing reactions
+    const { data: oldReacts } = await supabase
+      .from("reactions")
+      .select("*")
+      .eq("room_id", roomId)
+      .order("created_at", { ascending: true });
+    setReactions(oldReacts || []);
 
-      // Setup messages channel if not already set up
-      if (!messagesChannel.current) {
-        messagesChannel.current = supabase
-          .channel(`messages:${roomId}`)
-          .on(
-            "postgres_changes",
-            {
-              event: "INSERT",
-              schema: "public",
-              table: "messages",
-              filter: `room_id=eq.${roomId}`,
-            },
-            (payload) => {
-              // Check if message already exists to prevent duplicates
-              setMessages((prev) => {
-                const exists = prev.some((msg) => msg.id === payload.new.id);
-                return exists ? prev : [...prev, payload.new];
-              });
-            }
-          )
-          .subscribe((status, err) => {
-            if (err) {
-              console.error("Messages channel error:", err);
-              setTimeout(() => {
-                if (messagesChannel.current) {
-                  messagesChannel.current.subscribe();
-                }
-              }, 2000);
-            }
-          });
+    // Setup messages channel
+    subscribe('messages', {
+      channelName: `messages:${roomId}`,
+      options: {
+        event: "INSERT",
+        schema: "public",
+        table: "messages",
+        filter: `room_id=eq.${roomId}`,
+      },
+      onEvent: (payload) => {
+        setMessages(prev => {
+          const exists = prev.some(msg => msg.id === payload.new.id);
+          return exists ? prev : [...prev, payload.new];
+        });
       }
+    });
 
-      // Setup reactions channel if not already set up
-      if (!reactionsChannel.current) {
-        reactionsChannel.current = supabase
-          .channel(`reactions:${roomId}`)
-          .on(
-            "postgres_changes",
-            {
-              event: "*",
-              schema: "public",
-              table: "reactions",
-              filter: `room_id=eq.${roomId}`,
-            },
-            (payload) => {
-              try {
-                if (payload.eventType === "INSERT") {
-                  setReactions((prev) => {
-                    const exists = prev.some(
-                      (react) => react.id === payload.new.id
-                    );
-                    return exists ? prev : [...prev, payload.new];
-                  });
-                } else if (payload.eventType === "DELETE") {
-                  setReactions((prev) =>
-                    prev.filter((r) => r.id !== payload.old.id)
-                  );
-                }
-              } catch (e) {
-                console.error("Error processing reaction update:", e);
-              }
-            }
-          )
-          .subscribe((status, err) => {
-            if (err) {
-              console.error("Reactions channel error:", err);
-              setTimeout(() => {
-                if (reactionsChannel.current) {
-                  reactionsChannel.current.subscribe();
-                }
-              }, 2000);
-            }
+    // Setup reactions channel
+    subscribe('reactions', {
+      channelName: `reactions:${roomId}`,
+      options: {
+        event: "*",
+        schema: "public",
+        table: "reactions",
+        filter: `room_id=eq.${roomId}`,
+      },
+      onEvent: (payload) => {
+        if (payload.eventType === "INSERT") {
+          setReactions(prev => {
+            const exists = prev.some(react => react.id === payload.new.id);
+            return exists ? prev : [...prev, payload.new];
           });
+        } else if (payload.eventType === "DELETE") {
+          setReactions(prev => prev.filter(r => r.id !== payload.old.id));
+        }
       }
-    } catch (error) {
-      console.error("Error loading messages and reactions:", error);
-    }
-  };
+    });
 
-  const sendMessage = async () => {
-  if (!chatInput.trim() || !user?.email) return;
-  if (isSendingMessage) return;
+  } catch (error) {
+    console.error("Error loading messages and reactions:", error);
+  }
+}, [roomId, subscribe]);
+
+
+ const sendMessage = async () => {
+  if (!chatInput.trim() || !user?.email || isSendingMessage) return;
 
   setIsSendingMessage(true);
-  const tempId = Date.now().toString(); // Define tempId here at function scope
+  const tempId = Date.now().toString();
+  const tempMessage = {
+    id: tempId,
+    room_id: roomId,
+    sender: user.email,
+    text: chatInput,
+    created_at: new Date().toISOString(),
+    is_temp: true
+  };
+
+  // Optimistic update
+  setMessages(prev => [...prev, tempMessage]);
+  setChatInput('');
 
   try {
-    // Optimistic UI update
-    const newMessage = {
-      id: tempId,
-      room_id: roomId,
-      sender: user.email,
-      text: chatInput,
-      created_at: new Date().toISOString(),
-    };
-
-    setMessages((prev) => [...prev, newMessage]);
-    setChatInput("");
-
-    // Save to database
     const { data, error } = await supabase
       .from("messages")
       .insert({
@@ -1177,60 +1142,60 @@ export default function MeetingRoom() {
 
     if (error) throw error;
 
-    // Replace optimistic update with actual message from DB
-    setMessages((prev) => [...prev.filter((msg) => msg.id !== tempId), data]);
+    // Replace temp message with persisted message
+    setMessages(prev => prev.map(m => 
+      m.id === tempId ? data : m
+    ));
   } catch (error) {
     console.error("Failed to send message:", error);
     // Rollback optimistic update
-    setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
-    alert("Failed to send message. Please try again.");
+    setMessages(prev => prev.filter(m => m.id !== tempId));
   } finally {
     setIsSendingMessage(false);
   }
 };
 
   const sendReaction = async (emoji) => {
-    if (!user?.id || !roomId) return;
-    if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
+  if (!user?.id || !roomId) return;
+  if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
 
-    const tempId = Date.now().toString();
-    const newReaction = {
-      id: tempId,
+  const tempId = Date.now().toString();
+  const newReaction = {
+    id: tempId,
+    room_id: roomId,
+    user_id: user.id,
+    emoji,
+    created_at: new Date().toISOString(),
+  };
+
+  // Optimistic update
+  setReactions(prev => [...prev, newReaction]);
+
+  try {
+    const { error } = await supabase.from("reactions").insert({
       room_id: roomId,
       user_id: user.id,
       emoji,
       created_at: new Date().toISOString(),
-    };
+    });
 
-    // Optimistic UI update
-    setReactions((prev) => [...prev, newReaction]);
-
-    try {
-      const { error } = await supabase.from("reactions").insert({
-        room_id: roomId,
-        user_id: user.id,
-        emoji,
-        created_at: new Date().toISOString(),
-      });
-
-      if (error) {
-        // Rollback if error occurs
-        setReactions((prev) => prev.filter((r) => r.id !== tempId));
-        throw error;
-      }
-
-      // Add system message about reaction
-      await supabase.from("messages").insert({
-        room_id: roomId,
-        sender: "System",
-        text: `${user.email} reacted with ${emoji}`,
-        created_at: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error("Error sending reaction:", error);
-      alert(`Failed to send reaction: ${error.message}`);
+    if (error) {
+      // Rollback if error occurs
+      setReactions(prev => prev.filter(r => r.id !== tempId));
+      throw error;
     }
-  };
+
+    // Add system message about reaction
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      sender: "System",
+      text: `${user.email} reacted with ${emoji}`,
+      created_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Error sending reaction:", error);
+  }
+};
 
   const approveUser = async (uid) => {
     try {
@@ -1543,30 +1508,13 @@ export default function MeetingRoom() {
     }, [roomId]);
   };
 
-  const cleanupSubscriptions = async () => {
-    try {
-      const channels = [
-        signalsChannel,
-        waitingChannel,
-        participantListener,
-        messagesChannel,
-        reactionsChannel,
-        participantsChannel,
-      ];
-
-      for (const channelRef of channels) {
-        if (channelRef.current) {
-          // Only remove if the channel exists and is joined
-          if (channelRef.current.state === "joined") {
-            await supabase.removeChannel(channelRef.current);
-          }
-          channelRef.current = null;
-        }
-      }
-    } catch (error) {
-      console.warn("Error cleaning up subscriptions:", error);
-    }
-  };
+  const cleanupSubscriptions = useCallback(async () => {
+  try {
+    unsubscribeAll();
+  } catch (error) {
+    console.warn("Error cleaning up subscriptions:", error);
+  }
+}, [unsubscribeAll]);
 
   // Add this state
   const [approvalCheckCount, setApprovalCheckCount] = useState(0);
@@ -2134,8 +2082,44 @@ export default function MeetingRoom() {
   }, [roomId, permitToJoin, meetingDbId]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+}, [messages]);
+
+
+  useEffect(() => {
+  if (permitToJoin && roomId && meetingDbId) {
+    loadMessagesAndReactions();
+  }
+
+  return () => {
+    cleanupSubscriptions();
+  };
+}, [permitToJoin, roomId, meetingDbId, loadMessagesAndReactions, cleanupSubscriptions]);
+
+useEffect(() => {
+  if (!permitToJoin) return;
+
+  // Fallback polling for messages when real-time fails
+  const messagePolling = setInterval(async () => {
+    if (document.visibilityState === 'visible') {
+      const { data } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('room_id', roomId)
+        .order('created_at', { descending: true })
+        .limit(1);
+      
+      if (data?.[0]) {
+        setMessages(prev => {
+          const exists = prev.some(m => m.id === data[0].id);
+          return exists ? prev : [...prev, data[0]];
+        });
+      }
+    }
+  }, 30000); // 30 seconds as fallback
+
+  return () => clearInterval(messagePolling);
+}, [roomId, permitToJoin]);
 
   if (needPasscode) {
     return (
