@@ -8,7 +8,6 @@ const getStablePeerId = (userId) => {
   const storedId = sessionStorage.getItem(`peerId-${userId}`);
   if (storedId) return storedId;
 
-
   const newId = `peer-${userId}-${Math.random().toString(36).substr(2, 9)}`;
   sessionStorage.setItem(`peerId-${userId}`, newId);
   return newId;
@@ -17,328 +16,114 @@ const getStablePeerId = (userId) => {
 const formatTime = (seconds) => {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
-  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  return `${mins.toString().padStart(2, "0")}:${secs
+    .toString()
+    .padStart(2, "0")}`;
 };
 
 const AUTO_REFRESH_INTERVAL = 1000;
 
 export default function MeetingRoom() {
+  // State declarations
   const { roomId } = useParams();
   const navigate = useNavigate();
   const { search } = useLocation();
-  const [isSendingMessage, setIsSendingMessage] = useState(false);
+
+  // User and meeting state
   const [user, setUser] = useState({ id: null, email: null });
   const [isHost, setIsHost] = useState(false);
-  const [waitingList, setWaitingList] = useState([]);
-  const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
-  const [participants, setParticipants] = useState([]);
-  const [permitToJoin, setPermitToJoin] = useState(false);
   const [meetingDbId, setMeetingDbId] = useState(null);
-  const [messages, setMessages] = useState([]);
-  const [reactions, setReactions] = useState([]);
-  const [chatInput, setChatInput] = useState("");
-  const [inputPasscode, setInputPasscode] = useState("");
   const [passcodeRequired, setPasscodeRequired] = useState(false);
   const [needPasscode, setNeedPasscode] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
-  const [cameraOn, setCameraOn] = useState(true);
-  const [isRecording, setIsRecording] = useState(false);
+  const [inputPasscode, setInputPasscode] = useState("");
+
+  // Connection state
+  const [connectionStatus, setConnectionStatus] = useState("Connecting...");
   const [isInitialized, setIsInitialized] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
+  const [permitToJoin, setPermitToJoin] = useState(false);
   const [waitingForApproval, setWaitingForApproval] = useState(false);
-  const [showChat, setShowChat] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState("Connecting...");
-  const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [participantNames, setParticipantNames] = useState({});
-  const [activeSpeakers, setActiveSpeakers] = useState({});
-  const [connectionStats, setConnectionStats] = useState({});
-  const [showRecordingAlert, setShowRecordingAlert] = useState(false);
-  const [recordingAlertMessage, setRecordingAlertMessage] = useState("");
-  const [isMobile, setIsMobile] = useState(false);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-  const [hasNewMessages, setHasNewMessages] = useState(false);
   const [reconnectionState, setReconnectionState] = useState({
     isReconnecting: false,
     attempts: 0,
   });
 
+  // Participants state
+  const [participants, setParticipants] = useState([]);
+  const [waitingList, setWaitingList] = useState([]);
+  const [peerToUserIdMap, setPeerToUserIdMap] = useState({});
+  const [participantNames, setParticipantNames] = useState({});
+  const [showRecordingOptions, setShowRecordingOptions] = useState(false);
+  // Media state
+  const [isMuted, setIsMuted] = useState(false);
+  const [cameraOn, setCameraOn] = useState(true);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [activeSpeakers, setActiveSpeakers] = useState({});
+  const [connectionStats, setConnectionStats] = useState({});
+
+  // Chat state
+  const [messages, setMessages] = useState([]);
+  const [reactions, setReactions] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [showChat, setShowChat] = useState(false);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [hasNewMessages, setHasNewMessages] = useState(false);
+
+  // UI state
+  const [isMobile, setIsMobile] = useState(false);
+  const [showRecordingAlert, setShowRecordingAlert] = useState(false);
+  const [recordingAlertMessage, setRecordingAlertMessage] = useState("");
+
+  // Add this with your other state declarations
+  const [recordingState, setRecordingState] = useState({
+    isRecording: false,
+    duration: 0,
+    status: "idle", // 'idle' | 'starting' | 'recording' | 'stopping' | 'processing'
+    recordingType: null, // 'screen' | 'camera' | 'both'
+  });
+  // Refs
   const peerRef = useRef();
   const localStreamRef = useRef();
   const screenStreamRef = useRef();
   const recorderRef = useRef();
   const localVideoRef = useRef();
   const remoteVideosRef = useRef({});
-  const autoRefreshIntervalRef = useRef();
-  const isMountedRef = useRef(true);
-  const retryCountsRef = useRef({});
   const audioContextRef = useRef();
   const analysersRef = useRef({});
   const peerConnectionsRef = useRef({});
-  const statsIntervalRef = useRef();
   const messagesEndRef = useRef(null);
+  const recordingSessionIdRef = useRef();
   const recordingTimerRef = useRef();
   const participantUpdateTimeoutRef = useRef();
-  const pendingPeerConnections = useRef(new Set());
-  const activePeerConnections = useRef(new Set());
+  const statsIntervalRef = useRef();
+  const autoRefreshIntervalRef = useRef();
+  const isMountedRef = useRef(true);
+  const retryCountsRef = useRef({});
+  const refreshInterval = useRef();
+  const reconnectTimerRef = useRef();
   const screenShareContainerRef = useRef(null);
+
+  // Channels
   const waitingChannel = useRef();
   const participantListener = useRef();
   const signalsChannel = useRef();
   const messagesChannel = useRef();
   const reactionsChannel = useRef();
   const participantsChannel = useRef();
-  const refreshInterval = useRef();
-  const reconnectTimerRef = useRef();
 
+  // Connection sets
+  const pendingPeerConnections = useRef(new Set());
+  const activePeerConnections = useRef(new Set());
+
+  // Constants
   const BASE_URL = "https://zoomclone-v3.vercel.app";
   const shareLink = `${BASE_URL}/room/${roomId}${
     passcodeRequired ? `?passcode=${encodeURIComponent(inputPasscode)}` : ""
   }`;
 
-
-
-   useEffect(() => {
-    if (messages.length > 0) {
-      setHasNewMessages(true);
-    }
-  }, [messages]);
-
-  useEffect(() => {
-    if (hasNewMessages && isAtBottom) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-      setHasNewMessages(false);
-    }
-  }, [messages, hasNewMessages, isAtBottom]);
-
-
-
-  // Improved real-time message handling
-  const setupRealTimeMessages = useCallback(() => {
-    if (messagesChannel.current) {
-      supabase.removeChannel(messagesChannel.current);
-    }
-
-    messagesChannel.current = supabase
-      .channel(`messages:${roomId}:${user?.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${roomId}`,
-        },
-        async (payload) => {
-          // Check if we've already processed this message
-          const exists = messages.some((msg) => msg.id === payload.new.id);
-          if (exists) return;
-
-          // Add the message to state
-          setMessages((prev) => [...prev, payload.new]);
-
-          // Mark message as read
-          try {
-            await supabase.rpc("mark_message_as_read", {
-              message_id: payload.new.id,
-              user_id: user.id,
-            });
-          } catch (error) {
-            console.error("Error marking message as read:", error);
-          }
-        }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload) => {
-          // Handle message updates (like read receipts)
-          setMessages((prev) =>
-            prev.map((msg) => (msg.id === payload.new.id ? payload.new : msg))
-          );
-        }
-      )
-      .subscribe((status, err) => {
-        if (err) {
-          console.error("Messages channel error:", err);
-          setTimeout(setupRealTimeMessages, 2000);
-        }
-      });
-
-    return () => {
-      if (messagesChannel.current) {
-        supabase.removeChannel(messagesChannel.current);
-      }
-    };
-  }, [roomId, user?.id, messages]);
-
-  // Improved real-time reactions handling
-  const setupRealTimeReactions = useCallback(() => {
-    if (reactionsChannel.current) {
-      supabase.removeChannel(reactionsChannel.current);
-    }
-
-    const reactionDebounce = {};
-    const debounceTime = 300; // ms
-
-    reactionsChannel.current = supabase
-      .channel(`reactions:${roomId}:${user?.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "reactions",
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload) => {
-          // Debounce rapid reaction updates
-          const now = Date.now();
-          const lastUpdate = reactionDebounce[payload.new.id] || 0;
-
-          if (now - lastUpdate < debounceTime) return;
-          reactionDebounce[payload.new.id] = now;
-
-          if (payload.eventType === "INSERT") {
-            setReactions((prev) => {
-              const exists = prev.some((react) => react.id === payload.new.id);
-              return exists ? prev : [...prev, payload.new];
-            });
-          } else if (payload.eventType === "DELETE") {
-            setReactions((prev) => prev.filter((r) => r.id !== payload.old.id));
-          }
-        }
-      )
-      .subscribe((status, err) => {
-        if (err) {
-          console.error("Reactions channel error:", err);
-          setTimeout(setupRealTimeReactions, 2000);
-        }
-      });
-
-    return () => {
-      if (reactionsChannel.current) {
-        supabase.removeChannel(reactionsChannel.current);
-      }
-    };
-  }, [roomId, user?.id]);
-
-  const loadMessages = useCallback(async () => {
-    try {
-      const { data, error } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: false })
-        .limit(50); // Load most recent 50 messages
-
-      if (error) throw error;
-
-      // Reverse to show oldest first
-      setMessages(data.reverse());
-
-      // Mark all messages as read
-      if (data.length > 0 && user?.id) {
-        await supabase.rpc("mark_all_messages_as_read", {
-          room_id: roomId,
-          user_id: user.id,
-        });
-      }
-    } catch (error) {
-      console.error("Error loading messages:", error);
-    }
-  }, [roomId, user?.id]);
-
-  // Optimized reactions loading
-  const loadReactions = useCallback(async () => {
-    try {
-      const { data, error } = await supabase
-        .from("reactions")
-        .select("*")
-        .eq("room_id", roomId)
-        .order("created_at", { ascending: true });
-
-      if (error) throw error;
-      setReactions(data);
-    } catch (error) {
-      console.error("Error loading reactions:", error);
-    }
-  }, [roomId]);
-
-  const refreshMeetingState = useCallback(async () => {
-    if (!isMountedRef.current || !meetingDbId || !user?.id) return;
-
-    try {
-      if (permitToJoin) {
-        await updateParticipants(meetingDbId);
-      }
-
-      if (isHost) {
-        await updateWaitingList(meetingDbId);
-      }
-
-      if (peerRef.current?.id) {
-        const { data: others } = await supabase
-          .from("signals")
-          .select("peer_id, user_id")
-          .eq("room_id", roomId)
-          .neq("peer_id", peerRef.current.id);
-
-        if (others?.length > 0) {
-          others.forEach(({ peer_id }) => {
-            if (
-              !peerConnectionsRef.current[peer_id] &&
-              !pendingPeerConnections.current.has(peer_id)
-            ) {
-              connectToPeer(peer_id);
-            }
-          });
-        }
-      }
-
-      if (peerRef.current) {
-        if (peerRef.current.disconnected) {
-          setConnectionStatus("Reconnecting...");
-          peerRef.current.reconnect();
-        } else if (peerRef.current.open) {
-          setConnectionStatus("Connected");
-        }
-      }
-    } catch (error) {
-      console.error("Auto-refresh error:", error);
-    }
-  }, [meetingDbId, user?.id, permitToJoin, isHost, roomId]);
-
-  useEffect(() => {
-    if (permitToJoin && !autoRefreshIntervalRef.current) {
-      autoRefreshIntervalRef.current = setInterval(() => {
-        refreshMeetingState();
-      }, AUTO_REFRESH_INTERVAL);
-    }
-
-    return () => {
-      if (autoRefreshIntervalRef.current) {
-        clearInterval(autoRefreshIntervalRef.current);
-        autoRefreshIntervalRef.current = null;
-      }
-    };
-  }, [permitToJoin, refreshMeetingState]);
-
-  useEffect(() => {
-    const checkIfMobile = () => {
-      setIsMobile(
-        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-          navigator.userAgent
-        )
-      );
-    };
-    checkIfMobile();
-  }, []);
-
+  // Helper functions
   const ensureProfileExists = async (userId) => {
     const {
       data: { user },
@@ -374,96 +159,6 @@ export default function MeetingRoom() {
       alert("Failed to create join request. Please try again.");
     }
   };
-
-  const setupWaitingListener = useCallback((mtId) => {
-    updateWaitingList(mtId);
-
-    if (!waitingChannel.current) {
-      waitingChannel.current = supabase
-        .channel(`waiting:${mtId}`)
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "participants",
-            filter: `meeting_id=eq.${mtId}`,
-          },
-          (payload) => {
-            updateWaitingList(mtId);
-          }
-        )
-        .subscribe();
-    }
-  }, []);
-
-  const setupParticipantListener = useCallback(
-    (mtId, uid) => {
-      if (!participantListener.current) {
-        participantListener.current = supabase
-          .channel(`participant:${mtId}:${uid}`)
-          .on(
-            "postgres_changes",
-            {
-              event: "UPDATE",
-              schema: "public",
-              table: "participants",
-              filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
-            },
-            async (payload) => {
-              if (payload.new.status === "approved") {
-                setWaitingForApproval(false);
-                setPermitToJoin(true);
-
-                try {
-                  if (!localStreamRef.current) {
-                    await requestMediaPermissions();
-                  }
-
-                  if (!peerRef.current) {
-                    const peer = createPeer(user.id);
-                    peerRef.current = peer;
-
-                    peer.on("open", async (id) => {
-                      await supabase.from("signals").upsert({
-                        room_id: roomId,
-                        peer_id: id,
-                        user_id: user.id,
-                        last_active: new Date().toISOString(),
-                      });
-
-                      const { data: others } = await supabase
-                        .from("signals")
-                        .select("peer_id")
-                        .eq("room_id", roomId)
-                        .neq("peer_id", id);
-
-                      if (others?.length > 0) {
-                        others.forEach(({ peer_id }) => connectToPeer(peer_id));
-                      }
-                    });
-
-                    peer.on("call", (call) => {
-                      call.answer(localStreamRef.current);
-                      setupCall(call, call.peer);
-                    });
-                  }
-
-                  await updateParticipants(mtId);
-                  setConnectionStatus("Connected to meeting");
-                } catch (error) {
-                  console.error("Approval handling error:", error);
-                  setConnectionStatus("Connection failed - retrying...");
-                  setTimeout(() => setupParticipantListener(mtId, uid), 3000);
-                }
-              }
-            }
-          )
-          .subscribe();
-      }
-    },
-    [roomId, user?.id]
-  );
 
   const updateParticipants = async (meetingId) => {
     try {
@@ -676,216 +371,6 @@ export default function MeetingRoom() {
     requestAnimationFrame(analyzeAudio);
   };
 
-  const toggleScreenShare = async () => {
-    try {
-      if (isScreenSharing && screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((track) => track.stop());
-        screenStreamRef.current = null;
-        setIsScreenSharing(false);
-        return;
-      }
-
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-      });
-      screenStreamRef.current = screenStream;
-      setIsScreenSharing(true);
-
-      const screenTrack = screenStream.getVideoTracks()[0];
-      for (const connArray of Object.values(peerRef.current.connections)) {
-        connArray.forEach((conn) => {
-          const sender = conn.peerConnection
-            .getSenders()
-            .find((s) => s.track.kind === "video");
-          sender?.replaceTrack(screenTrack);
-        });
-      }
-
-      screenTrack.onended = () => {
-        const camTrack = localStreamRef.current.getVideoTracks()[0];
-        for (const connArray of Object.values(peerRef.current.connections)) {
-          connArray.forEach((conn) => {
-            const sender = conn.peerConnection
-              .getSenders()
-              .find((s) => s.track.kind === "video");
-            sender?.replaceTrack(camTrack);
-          });
-        }
-        localVideoRef.current.srcObject = localStreamRef.current;
-        setIsScreenSharing(false);
-        screenStreamRef.current = null;
-      };
-    } catch (err) {
-      console.error("Screen share error:", err);
-      setIsScreenSharing(false);
-    }
-  };
-
-  const toggleMute = () => {
-    if (localStreamRef.current) {
-      const audioTracks = localStreamRef.current.getAudioTracks();
-      const newMuteState = !isMuted;
-      audioTracks.forEach((track) => {
-        track.enabled = !newMuteState;
-      });
-      setIsMuted(newMuteState);
-    }
-  };
-
-  const toggleCamera = () => {
-    if (localStreamRef.current) {
-      const videoTracks = localStreamRef.current.getVideoTracks();
-      const newCameraState = !cameraOn;
-      videoTracks.forEach((track) => {
-        track.enabled = newCameraState;
-      });
-      setCameraOn(newCameraState);
-    }
-  };
-
-  const startRecording = async () => {
-  if (!localStreamRef.current) {
-    alert("Please join the meeting first to start recording.");
-    return;
-  }
-
-  try {
-    // Request screen sharing with audio (system audio)
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true, // This captures system audio in supported browsers
-    });
-
-    // Create a combined stream with screen, camera, and microphone
-    const combinedStream = new MediaStream();
-
-    // Add screen video and audio tracks
-    screenStream.getVideoTracks().forEach(track => combinedStream.addTrack(track));
-    screenStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
-
-    // Add local camera and microphone if enabled
-    if (cameraOn) {
-      localStreamRef.current.getVideoTracks().forEach(track => {
-        combinedStream.addTrack(track);
-      });
-    }
-    if (!isMuted) {
-      localStreamRef.current.getAudioTracks().forEach(track => {
-        combinedStream.addTrack(track);
-      });
-    }
-
-    // Initialize recorder with the combined stream
-    const recorder = new RecordRTC(combinedStream, {
-      type: 'video',
-      mimeType: 'video/webm;codecs=vp9,opus',
-      bitsPerSecond: 2500000, // Higher quality
-      videoBitsPerSecond: 2000000,
-      audioBitsPerSecond: 128000,
-      frameRate: isMobile ? 15 : 30,
-      recorderType: RecordRTC.MediaStreamRecorder,
-      disableLogs: true,
-      timeSlice: 1000, // Save every second
-      ondataavailable: (blob) => {
-        // Handle chunks if needed
-      }
-    });
-
-    recorder.startRecording();
-    recorderRef.current = recorder;
-    screenStreamRef.current = screenStream; // Store for cleanup
-    setIsRecording(true);
-
-    // Handle when screen sharing is stopped
-    screenStream.getVideoTracks()[0].onended = () => {
-      stopRecording();
-    };
-
-    setRecordingAlertMessage("Recording started");
-    setShowRecordingAlert(true);
-    alert("🔴 Recording started! (Screen + Audio + Video)");
-
-    let seconds = 0;
-    recordingTimerRef.current = setInterval(() => {
-      seconds++;
-      setRecordingAlertMessage(`Recording (${formatTime(seconds)})`);
-    }, 1000);
-
-  } catch (err) {
-    console.error("Recording start error:", err);
-    alert(`Failed to start recording: ${err.message}`);
-  }
-};
-
-const stopRecording = async () => {
-  if (!recorderRef.current) return;
-  
-  try {
-    clearInterval(recordingTimerRef.current);
-
-    // Stop all tracks
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-
-    // Get the final recording blob
-    const blob = await new Promise((resolve) => {
-      recorderRef.current.stopRecording(() => {
-        resolve(recorderRef.current.getBlob());
-      });
-    });
-
-    if (!blob || blob.size === 0) {
-      throw new Error("Recording produced empty file");
-    }
-
-    // Generate filename with timestamp
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `recording-${roomId}-${timestamp}.webm`;
-
-    // Upload to Supabase storage
-    const { data, error } = await supabase.storage
-      .from("recordings")
-      .upload(`public/${filename}`, blob, {
-        contentType: "video/webm",
-        upsert: false,
-        cacheControl: '3600'
-      });
-
-    if (error) throw error;
-
-    // Get public URL
-    const { data: { publicUrl } } = await supabase.storage
-      .from("recordings")
-      .getPublicUrl(`public/${filename}`);
-
-    // Save recording metadata to database
-    const { data: userData } = await supabase.auth.getUser();
-    await supabase.from("recordings").insert({
-      room_id: roomId,
-      uploaded_by: userData.user.id,
-      file_name: filename,
-      file_url: publicUrl,
-      file_size: blob.size,
-      duration: Math.floor(recorderRef.current.getBlob().duration),
-      created_at: new Date().toISOString(),
-      recording_type: "screen_with_audio"
-    });
-
-    alert("✅ Recording saved and uploaded successfully!");
-    setIsRecording(false);
-    recorderRef.current = null;
-    screenStreamRef.current = null;
-
-  } catch (err) {
-    console.error("Recording stop error:", err);
-    alert(`Failed to save recording: ${err.message}`);
-    setIsRecording(false);
-    recorderRef.current = null;
-    screenStreamRef.current = null;
-  }
-};
-
   const createPeer = (userId) => {
     const peerId = getStablePeerId(userId);
     const peer = new Peer(peerId, {
@@ -958,48 +443,6 @@ const stopRecording = async () => {
     });
 
     return peer;
-  };
-
-  const reconnectPeers = async () => {
-    if (!peerRef.current?.id || reconnectionState.isReconnecting) return;
-
-    try {
-      setReconnectionState({ isReconnecting: true, attempts: 0 });
-
-      const { data: others } = await supabase
-        .from("signals")
-        .select("peer_id, user_id")
-        .eq("room_id", roomId)
-        .neq("peer_id", peerRef.current.id);
-
-      if (others?.length > 0) {
-        const MAX_CONCURRENT_CONNECTIONS = 3;
-        const connectionGroups = [];
-
-        for (let i = 0; i < others.length; i += MAX_CONCURRENT_CONNECTIONS) {
-          connectionGroups.push(
-            others.slice(i, i + MAX_CONCURRENT_CONNECTIONS)
-          );
-        }
-
-        for (const group of connectionGroups) {
-          await Promise.all(group.map((o) => connectToPeer(o.peer_id)));
-        }
-      }
-
-      setReconnectionState({ isReconnecting: false, attempts: 0 });
-    } catch (error) {
-      console.error("Reconnection error:", error);
-      const nextAttempt = reconnectionState.attempts + 1;
-      if (nextAttempt <= 5) {
-        setTimeout(() => {
-          reconnectPeers();
-        }, Math.min(5000, 1000 * nextAttempt));
-        setReconnectionState({ isReconnecting: true, attempts: nextAttempt });
-      } else {
-        setReconnectionState({ isReconnecting: false, attempts: 0 });
-      }
-    }
   };
 
   const connectToPeer = async (peerId) => {
@@ -1211,406 +654,45 @@ const stopRecording = async () => {
     }
   };
 
-  const loadMessagesAndReactions = useCallback(async () => {
-    await Promise.all([loadMessages(), loadReactions()]);
-    setupRealTimeMessages();
-    setupRealTimeReactions();
-  }, [
-    loadMessages,
-    loadReactions,
-    setupRealTimeMessages,
-    setupRealTimeReactions,
-  ]);
-
-  // Improved message sending with optimistic updates
-  const sendMessage = async () => {
-    if (!chatInput.trim() || !user?.email) return;
-    if (isSendingMessage) return;
-
-    setIsSendingMessage(true);
-    const tempId = Date.now().toString();
+  const reconnectPeers = async () => {
+    if (!peerRef.current?.id || reconnectionState.isReconnecting) return;
 
     try {
-      // Optimistic update
-      const newMessage = {
-        id: tempId,
-        room_id: roomId,
-        sender: user.email,
-        text: chatInput,
-        created_at: new Date().toISOString(),
-        read_by: [user.id],
-      };
+      setReconnectionState({ isReconnecting: true, attempts: 0 });
 
-      setMessages((prev) => [...prev, newMessage]);
-      setChatInput("");
+      const { data: others } = await supabase
+        .from("signals")
+        .select("peer_id, user_id")
+        .eq("room_id", roomId)
+        .neq("peer_id", peerRef.current.id);
 
-      // Persist to database
-      const { data, error } = await supabase
-        .from("messages")
-        .insert({
-          room_id: roomId,
-          sender: user.email,
-          text: chatInput,
-        })
-        .select()
-        .single();
+      if (others?.length > 0) {
+        const MAX_CONCURRENT_CONNECTIONS = 3;
+        const connectionGroups = [];
 
-      if (error) throw error;
-
-      // Replace optimistic update with real message
-      setMessages((prev) => [
-        ...prev.filter((msg) => msg.id !== tempId),
-        { ...data, read_by: [user.id] },
-      ]);
-
-      // Scroll to bottom
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    } catch (error) {
-      console.error("Failed to send message:", error);
-      // Rollback optimistic update
-      setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
-      alert("Failed to send message. Please try again.");
-    } finally {
-      setIsSendingMessage(false);
-    }
-  };
-
-  // const sendMessage = async () => {
-  //   if (!chatInput.trim() || !user?.email) return;
-  //   if (isSendingMessage) return;
-
-  //   setIsSendingMessage(true);
-  //   const tempId = Date.now().toString();
-
-  //   try {
-  //     const newMessage = {
-  //       id: tempId,
-  //       room_id: roomId,
-  //       sender: user.email,
-  //       text: chatInput,
-  //       created_at: new Date().toISOString(),
-  //     };
-
-  //     setMessages((prev) => [...prev, newMessage]);
-  //     setChatInput("");
-
-  //     const { data, error } = await supabase
-  //       .from("messages")
-  //       .insert({
-  //         room_id: roomId,
-  //         sender: user.email,
-  //         text: chatInput,
-  //       })
-  //       .select()
-  //       .single();
-
-  //     if (error) throw error;
-
-  //     setMessages((prev) => [...prev.filter((msg) => msg.id !== tempId), data]);
-  //   } catch (error) {
-  //     console.error("Failed to send message:", error);
-  //     setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
-  //     alert("Failed to send message. Please try again.");
-  //   } finally {
-  //     setIsSendingMessage(false);
-  //   }
-  // };
-
-  const sendReaction = async (emoji) => {
-    if (!user?.id || !roomId) return;
-    if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
-
-    // Check if user already sent this reaction recently
-    const lastReaction = reactions.find(
-      (r) => r.user_id === user.id && r.emoji === emoji
-    );
-
-    if (
-      lastReaction &&
-      Date.now() - new Date(lastReaction.created_at).getTime() < 1000
-    ) {
-      return; // Prevent rapid duplicate reactions
-    }
-
-    const tempId = Date.now().toString();
-    const newReaction = {
-      id: tempId,
-      room_id: roomId,
-      user_id: user.id,
-      emoji,
-      created_at: new Date().toISOString(),
-    };
-
-    // Optimistic update
-    setReactions((prev) => [...prev, newReaction]);
-
-    try {
-      const { error } = await supabase.from("reactions").insert({
-        room_id: roomId,
-        user_id: user.id,
-        emoji,
-      });
-
-      if (error) {
-        // Rollback optimistic update
-        setReactions((prev) => prev.filter((r) => r.id !== tempId));
-        throw error;
-      }
-
-      // Add system message about reaction
-      await supabase.from("messages").insert({
-        room_id: roomId,
-        sender: "System",
-        text: `${user.email} reacted with ${emoji}`,
-        created_at: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error("Error sending reaction:", error);
-      alert(`Failed to send reaction: ${error.message}`);
-    }
-  };
-
-  const approveUser = async (uid) => {
-    try {
-      const { data: userProfile } = await supabase
-        .from("profiles")
-        .select("email")
-        .eq("id", uid)
-        .single();
-
-      const { error: updateError } = await supabase
-        .from("participants")
-        .update({
-          status: "approved",
-          email: userProfile?.email,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", uid);
-
-      if (updateError) throw updateError;
-    } catch (error) {
-      console.error("Error approving user:", error);
-      alert("Failed to approve user. Please try again.");
-    }
-  };
-
-  const denyUser = async (uid) => {
-    try {
-      const { error } = await supabase
-        .from("participants")
-        .update({
-          status: "denied",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("meeting_id", meetingDbId)
-        .eq("user_id", uid);
-
-      if (error) throw error;
-    } catch (error) {
-      console.error("Error denying user:", error);
-      alert("Failed to deny user. Please try again.");
-    }
-  };
-
-  const leaveRoom = async () => {
-    if (!isMountedRef.current) return;
-
-    try {
-      if (isRecording) await stopRecording();
-
-      if (isScreenSharing && screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((track) => track.stop());
-        screenStreamRef.current = null;
-        setIsScreenSharing(false);
-      }
-
-      if (screenShareContainerRef.current) {
-        screenShareContainerRef.current.remove();
-        screenShareContainerRef.current = null;
-      }
-
-      if (peerRef.current?.id) {
-        await supabase
-          .from("signals")
-          .delete()
-          .eq("room_id", roomId)
-          .eq("peer_id", peerRef.current.id);
-      }
-
-      if (peerRef.current) {
-        peerRef.current.destroy();
-        peerRef.current = null;
-      }
-
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => track.stop());
-        localStreamRef.current = null;
-      }
-
-      Object.values(remoteVideosRef.current).forEach((el) => el.remove());
-      remoteVideosRef.current = {};
-
-      if (refreshInterval.current) {
-        clearInterval(refreshInterval.current);
-        refreshInterval.current = null;
-      }
-
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-        recordingTimerRef.current = null;
-      }
-
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-
-      if (participantUpdateTimeoutRef.current) {
-        clearTimeout(participantUpdateTimeoutRef.current);
-        participantUpdateTimeoutRef.current = null;
-      }
-
-      if (autoRefreshIntervalRef.current) {
-        clearInterval(autoRefreshIntervalRef.current);
-        autoRefreshIntervalRef.current = null;
-      }
-
-      if (meetingDbId && user?.id) {
-        await supabase
-          .from("participants")
-          .delete()
-          .eq("meeting_id", meetingDbId)
-          .eq("user_id", user.id);
-      }
-
-      if (messagesChannel.current) {
-        supabase.removeChannel(messagesChannel.current);
-        messagesChannel.current = null;
-      }
-
-      if (reactionsChannel.current) {
-        supabase.removeChannel(reactionsChannel.current);
-        reactionsChannel.current = null;
-      }
-
-      if (participantsChannel.current) {
-        supabase.removeChannel(participantsChannel.current);
-        participantsChannel.current = null;
-      }
-
-      if (waitingChannel.current) {
-        supabase.removeChannel(waitingChannel.current);
-        waitingChannel.current = null;
-      }
-
-      setIsInitialized(false);
-      setPermitToJoin(false);
-      setWaitingForApproval(false);
-
-      navigate("/");
-    } catch (err) {
-      console.warn("Leave room error:", err);
-      navigate("/");
-    }
-  };
-
-  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
-
-  useEffect(() => {
-    if (!waitingForApproval || !meetingDbId || !user?.id) return;
-
-    const listener = supabase
-      .channel(`approval:${meetingDbId}:${user.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "participants",
-          filter: `meeting_id=eq.${meetingDbId},user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          if (payload.new.status === "approved") {
-            handleApproval();
-          }
+        for (let i = 0; i < others.length; i += MAX_CONCURRENT_CONNECTIONS) {
+          connectionGroups.push(
+            others.slice(i, i + MAX_CONCURRENT_CONNECTIONS)
+          );
         }
-      )
-      .subscribe();
 
-    const interval = setInterval(async () => {
-      try {
-        const { data } = await supabase
-          .from("participants")
-          .select("status")
-          .eq("meeting_id", meetingDbId)
-          .eq("user_id", user.id)
-          .single();
-
-        if (data?.status === "approved") {
-          handleApproval();
-          clearInterval(interval);
-        } else {
-          setApprovalCheckCount((prev) => prev + 1);
+        for (const group of connectionGroups) {
+          await Promise.all(group.map((o) => connectToPeer(o.peer_id)));
         }
-      } catch (error) {
-        console.error("Approval check error:", error);
-      }
-    }, 10000);
-
-    const handleApproval = () => {
-      setWaitingForApproval(false);
-      setPermitToJoin(true);
-      clearInterval(interval);
-      supabase.removeChannel(listener);
-      initializeAfterApproval();
-    };
-
-    return () => {
-      clearInterval(interval);
-      supabase.removeChannel(listener);
-    };
-  }, [waitingForApproval, meetingDbId, user?.id]);
-
-  const initializeAfterApproval = async () => {
-    try {
-      await requestMediaPermissions();
-
-      if (!peerRef.current) {
-        const peer = createPeer(user.id);
-        peerRef.current = peer;
-
-        peer.on("open", async (id) => {
-          await supabase.from("signals").upsert({
-            room_id: roomId,
-            peer_id: id,
-            user_id: user.id,
-            last_active: new Date().toISOString(),
-          });
-
-          const { data: others } = await supabase
-            .from("signals")
-            .select("peer_id")
-            .eq("room_id", roomId)
-            .neq("peer_id", id);
-
-          if (others?.length > 0) {
-            others.forEach(({ peer_id }) => connectToPeer(peer_id));
-          }
-        });
-
-        peer.on("call", (call) => {
-          call.answer(localStreamRef.current);
-          setupCall(call, call.peer);
-        });
       }
 
-      await updateParticipants(meetingDbId);
-      setConnectionStatus("Connected to meeting");
+      setReconnectionState({ isReconnecting: false, attempts: 0 });
     } catch (error) {
-      console.error("Post-approval initialization error:", error);
-      setConnectionStatus("Connection failed - retrying...");
-      setTimeout(initializeAfterApproval, 3000);
+      console.error("Reconnection error:", error);
+      const nextAttempt = reconnectionState.attempts + 1;
+      if (nextAttempt <= 5) {
+        setTimeout(() => {
+          reconnectPeers();
+        }, Math.min(5000, 1000 * nextAttempt));
+        setReconnectionState({ isReconnecting: true, attempts: nextAttempt });
+      } else {
+        setReconnectionState({ isReconnecting: false, attempts: 0 });
+      }
     }
   };
 
@@ -1772,6 +854,96 @@ const stopRecording = async () => {
     [isJoining, isScreenSharing, roomId, user?.email]
   );
 
+  const setupWaitingListener = useCallback((mtId) => {
+    updateWaitingList(mtId);
+
+    if (!waitingChannel.current) {
+      waitingChannel.current = supabase
+        .channel(`waiting:${mtId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "participants",
+            filter: `meeting_id=eq.${mtId}`,
+          },
+          (payload) => {
+            updateWaitingList(mtId);
+          }
+        )
+        .subscribe();
+    }
+  }, []);
+
+  const setupParticipantListener = useCallback(
+    (mtId, uid) => {
+      if (!participantListener.current) {
+        participantListener.current = supabase
+          .channel(`participant:${mtId}:${uid}`)
+          .on(
+            "postgres_changes",
+            {
+              event: "UPDATE",
+              schema: "public",
+              table: "participants",
+              filter: `meeting_id=eq.${mtId},user_id=eq.${uid}`,
+            },
+            async (payload) => {
+              if (payload.new.status === "approved") {
+                setWaitingForApproval(false);
+                setPermitToJoin(true);
+
+                try {
+                  if (!localStreamRef.current) {
+                    await requestMediaPermissions();
+                  }
+
+                  if (!peerRef.current) {
+                    const peer = createPeer(user.id);
+                    peerRef.current = peer;
+
+                    peer.on("open", async (id) => {
+                      await supabase.from("signals").upsert({
+                        room_id: roomId,
+                        peer_id: id,
+                        user_id: user.id,
+                        last_active: new Date().toISOString(),
+                      });
+
+                      const { data: others } = await supabase
+                        .from("signals")
+                        .select("peer_id")
+                        .eq("room_id", roomId)
+                        .neq("peer_id", id);
+
+                      if (others?.length > 0) {
+                        others.forEach(({ peer_id }) => connectToPeer(peer_id));
+                      }
+                    });
+
+                    peer.on("call", (call) => {
+                      call.answer(localStreamRef.current);
+                      setupCall(call, call.peer);
+                    });
+                  }
+
+                  await updateParticipants(mtId);
+                  setConnectionStatus("Connected to meeting");
+                } catch (error) {
+                  console.error("Approval handling error:", error);
+                  setConnectionStatus("Connection failed - retrying...");
+                  setTimeout(() => setupParticipantListener(mtId, uid), 3000);
+                }
+              }
+            }
+          )
+          .subscribe();
+      }
+    },
+    [roomId, user?.id]
+  );
+
   const setupParticipantsListener = useCallback((mtId) => {
     if (!participantsChannel.current) {
       participantsChannel.current = supabase
@@ -1797,12 +969,847 @@ const stopRecording = async () => {
     }
   }, []);
 
+  const loadMessages = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      // Reverse to show oldest first
+      setMessages(data.reverse());
+
+      // Mark all messages as read
+      if (data.length > 0 && user?.id) {
+        await supabase.rpc("mark_all_messages_as_read", {
+          room_id: roomId,
+          user_id: user.id,
+        });
+      }
+    } catch (error) {
+      console.error("Error loading messages:", error);
+    }
+  }, [roomId, user?.id]);
+
+  const loadReactions = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("reactions")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true });
+
+      if (error) throw error;
+      setReactions(data);
+    } catch (error) {
+      console.error("Error loading reactions:", error);
+    }
+  }, [roomId]);
+
+  const setupRealTimeMessages = useCallback(() => {
+    if (messagesChannel.current) {
+      supabase.removeChannel(messagesChannel.current);
+    }
+
+    messagesChannel.current = supabase
+      .channel(`messages:${roomId}:${user?.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${roomId}`,
+        },
+        async (payload) => {
+          // Check if we've already processed this message
+          const exists = messages.some((msg) => msg.id === payload.new.id);
+          if (exists) return;
+
+          // Add the message to state
+          setMessages((prev) => [...prev, payload.new]);
+
+          // Mark message as read
+          try {
+            await supabase.rpc("mark_message_as_read", {
+              message_id: payload.new.id,
+              user_id: user.id,
+            });
+          } catch (error) {
+            console.error("Error marking message as read:", error);
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          // Handle message updates (like read receipts)
+          setMessages((prev) =>
+            prev.map((msg) => (msg.id === payload.new.id ? payload.new : msg))
+          );
+        }
+      )
+      .subscribe((status, err) => {
+        if (err) {
+          console.error("Messages channel error:", err);
+          setTimeout(setupRealTimeMessages, 2000);
+        }
+      });
+
+    return () => {
+      if (messagesChannel.current) {
+        supabase.removeChannel(messagesChannel.current);
+      }
+    };
+  }, [roomId, user?.id, messages]);
+
+  const setupRealTimeReactions = useCallback(() => {
+    if (reactionsChannel.current) {
+      supabase.removeChannel(reactionsChannel.current);
+    }
+
+    const reactionDebounce = {};
+    const debounceTime = 300; // ms
+
+    reactionsChannel.current = supabase
+      .channel(`reactions:${roomId}:${user?.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "reactions",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          // Debounce rapid reaction updates
+          const now = Date.now();
+          const lastUpdate = reactionDebounce[payload.new.id] || 0;
+
+          if (now - lastUpdate < debounceTime) return;
+          reactionDebounce[payload.new.id] = now;
+
+          if (payload.eventType === "INSERT") {
+            setReactions((prev) => {
+              const exists = prev.some((react) => react.id === payload.new.id);
+              return exists ? prev : [...prev, payload.new];
+            });
+          } else if (payload.eventType === "DELETE") {
+            setReactions((prev) => prev.filter((r) => r.id !== payload.old.id));
+          }
+        }
+      )
+      .subscribe((status, err) => {
+        if (err) {
+          console.error("Reactions channel error:", err);
+          setTimeout(setupRealTimeReactions, 2000);
+        }
+      });
+
+    return () => {
+      if (reactionsChannel.current) {
+        supabase.removeChannel(reactionsChannel.current);
+      }
+    };
+  }, [roomId, user?.id]);
+
+  const loadMessagesAndReactions = useCallback(async () => {
+    await Promise.all([loadMessages(), loadReactions()]);
+    setupRealTimeMessages();
+    setupRealTimeReactions();
+  }, [
+    loadMessages,
+    loadReactions,
+    setupRealTimeMessages,
+    setupRealTimeReactions,
+  ]);
+
+  const sendMessage = async () => {
+    if (!chatInput.trim() || !user?.email) return;
+    if (isSendingMessage) return;
+
+    setIsSendingMessage(true);
+    const tempId = Date.now().toString();
+
+    try {
+      // Optimistic update
+      const newMessage = {
+        id: tempId,
+        room_id: roomId,
+        sender: user.email,
+        text: chatInput,
+        created_at: new Date().toISOString(),
+        read_by: [user.id],
+      };
+
+      setMessages((prev) => [...prev, newMessage]);
+      setChatInput("");
+
+      // Persist to database
+      const { data, error } = await supabase
+        .from("messages")
+        .insert({
+          room_id: roomId,
+          sender: user.email,
+          text: chatInput,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Replace optimistic update with real message
+      setMessages((prev) => [
+        ...prev.filter((msg) => msg.id !== tempId),
+        { ...data, read_by: [user.id] },
+      ]);
+
+      // Scroll to bottom
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    } catch (error) {
+      console.error("Failed to send message:", error);
+      // Rollback optimistic update
+      setMessages((prev) => prev.filter((msg) => msg.id !== tempId));
+      alert("Failed to send message. Please try again.");
+    } finally {
+      setIsSendingMessage(false);
+    }
+  };
+
+  const sendReaction = async (emoji) => {
+    if (!user?.id || !roomId) return;
+    if (!emoji || typeof emoji !== "string" || emoji.length > 10) return;
+
+    // Check if user already sent this reaction recently
+    const lastReaction = reactions.find(
+      (r) => r.user_id === user.id && r.emoji === emoji
+    );
+
+    if (
+      lastReaction &&
+      Date.now() - new Date(lastReaction.created_at).getTime() < 1000
+    ) {
+      return; // Prevent rapid duplicate reactions
+    }
+
+    const tempId = Date.now().toString();
+    const newReaction = {
+      id: tempId,
+      room_id: roomId,
+      user_id: user.id,
+      emoji,
+      created_at: new Date().toISOString(),
+    };
+
+    // Optimistic update
+    setReactions((prev) => [...prev, newReaction]);
+
+    try {
+      const { error } = await supabase.from("reactions").insert({
+        room_id: roomId,
+        user_id: user.id,
+        emoji,
+      });
+
+      if (error) {
+        // Rollback optimistic update
+        setReactions((prev) => prev.filter((r) => r.id !== tempId));
+        throw error;
+      }
+
+      // Add system message about reaction
+      await supabase.from("messages").insert({
+        room_id: roomId,
+        sender: "System",
+        text: `${user.email} reacted with ${emoji}`,
+        created_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("Error sending reaction:", error);
+      alert(`Failed to send reaction: ${error.message}`);
+    }
+  };
+
+  const approveUser = async (uid) => {
+    try {
+      const { data: userProfile } = await supabase
+        .from("profiles")
+        .select("email")
+        .eq("id", uid)
+        .single();
+
+      const { error: updateError } = await supabase
+        .from("participants")
+        .update({
+          status: "approved",
+          email: userProfile?.email,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", uid);
+
+      if (updateError) throw updateError;
+    } catch (error) {
+      console.error("Error approving user:", error);
+      alert("Failed to approve user. Please try again.");
+    }
+  };
+
+  const denyUser = async (uid) => {
+    try {
+      const { error } = await supabase
+        .from("participants")
+        .update({
+          status: "denied",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("meeting_id", meetingDbId)
+        .eq("user_id", uid);
+
+      if (error) throw error;
+    } catch (error) {
+      console.error("Error denying user:", error);
+      alert("Failed to deny user. Please try again.");
+    }
+  };
+
+  const toggleScreenShare = async () => {
+    try {
+      if (isScreenSharing && screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((track) => track.stop());
+        screenStreamRef.current = null;
+        setIsScreenSharing(false);
+        return;
+      }
+
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+      });
+      screenStreamRef.current = screenStream;
+      setIsScreenSharing(true);
+
+      const screenTrack = screenStream.getVideoTracks()[0];
+      for (const connArray of Object.values(peerRef.current.connections)) {
+        connArray.forEach((conn) => {
+          const sender = conn.peerConnection
+            .getSenders()
+            .find((s) => s.track.kind === "video");
+          sender?.replaceTrack(screenTrack);
+        });
+      }
+
+      screenTrack.onended = () => {
+        const camTrack = localStreamRef.current.getVideoTracks()[0];
+        for (const connArray of Object.values(peerRef.current.connections)) {
+          connArray.forEach((conn) => {
+            const sender = conn.peerConnection
+              .getSenders()
+              .find((s) => s.track.kind === "video");
+            sender?.replaceTrack(camTrack);
+          });
+        }
+        localVideoRef.current.srcObject = localStreamRef.current;
+        setIsScreenSharing(false);
+        screenStreamRef.current = null;
+      };
+    } catch (err) {
+      console.error("Screen share error:", err);
+      setIsScreenSharing(false);
+    }
+  };
+
+  const toggleMute = () => {
+    if (localStreamRef.current) {
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      const newMuteState = !isMuted;
+      audioTracks.forEach((track) => {
+        track.enabled = !newMuteState;
+      });
+      setIsMuted(newMuteState);
+    }
+  };
+
+  const toggleCamera = () => {
+    if (localStreamRef.current) {
+      const videoTracks = localStreamRef.current.getVideoTracks();
+      const newCameraState = !cameraOn;
+      videoTracks.forEach((track) => {
+        track.enabled = newCameraState;
+      });
+      setCameraOn(newCameraState);
+    }
+  };
+
+  const startRecording = async (type = "screen") => {
+    try {
+      setRecordingState({
+        isRecording: true,
+        duration: 0,
+        status: "starting",
+        recordingType: type,
+      });
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const fileName = `recording-${timestamp}.webm`;
+      const filePath = `recordings/${roomId}/${fileName}`;
+
+      // Create recording record
+      const { data, error } = await supabase
+        .from("recordings")
+        .insert({
+          room_id: roomId,
+          user_id: user?.id,
+          status: "starting",
+          file_name: fileName,
+          file_path: filePath,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      recordingSessionIdRef.current = data.id;
+
+      // Get streams based on recording type
+      let videoStream;
+      let audioStream;
+
+      if (type === "screen" || type === "both") {
+        try {
+          videoStream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+              displaySurface: "monitor",
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+              frameRate: { ideal: 30 },
+            },
+            audio: false,
+          });
+          screenStreamRef.current = videoStream;
+        } catch (err) {
+          if (type === "both") {
+            // Fallback to camera if screen sharing fails
+            if (!localStreamRef.current) {
+              await requestMediaPermissions();
+            }
+            videoStream = localStreamRef.current;
+          } else {
+            throw err;
+          }
+        }
+      } else if (type === "camera") {
+        if (!localStreamRef.current) {
+          await requestMediaPermissions();
+        }
+        videoStream = localStreamRef.current;
+      }
+
+      // Always use local audio
+      if (!localStreamRef.current) {
+        await requestMediaPermissions();
+      }
+      audioStream = new MediaStream(localStreamRef.current.getAudioTracks());
+
+      // Combine streams
+      const combinedStream = new MediaStream();
+
+      // Add video track (only one)
+      if (videoStream) {
+        const videoTracks = videoStream.getVideoTracks();
+        if (videoTracks.length > 0) {
+          combinedStream.addTrack(videoTracks[0]);
+        }
+      }
+
+      // Add audio track
+      const audioTracks = audioStream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        combinedStream.addTrack(audioTracks[0]);
+      }
+
+      // Handle screen capture stop
+      if (type === "screen" || type === "both") {
+        if (videoStream) {
+          const tracks = videoStream.getVideoTracks();
+          if (tracks && tracks[0]) {
+            tracks[0].onended = stopRecording;
+          }
+        }
+      }
+
+      const recorder = new RecordRTC(combinedStream, {
+        type: "video",
+        mimeType: "video/webm",
+        bitsPerSecond: 2500000,
+      });
+
+      recorder.startRecording();
+      recorderRef.current = recorder;
+
+      // Update status
+      await supabase
+        .from("recordings")
+        .update({ status: "recording" })
+        .eq("id", recordingSessionIdRef.current);
+
+      // Start timer
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingState((prev) => ({
+          ...prev,
+          duration: prev.duration + 1,
+          status: "recording",
+        }));
+      }, 1000);
+    } catch (err) {
+      console.error("Recording error:", err);
+      setRecordingState({
+        isRecording: false,
+        duration: 0,
+        status: "idle",
+        recordingType: null,
+      });
+      setShowRecordingAlert(true);
+      setRecordingAlertMessage(`Failed to start recording: ${err.message}`);
+      setTimeout(() => setShowRecordingAlert(false), 5000);
+    }
+  };
+
+  const stopRecording = async () => {
+    if (!recordingState.isRecording) return;
+
+    try {
+      setRecordingState((prev) => ({
+        ...prev,
+        status: "stopping",
+      }));
+
+      // Get final recording blob
+      const blob = await new Promise((resolve) => {
+        recorderRef.current.stopRecording(() => {
+          resolve(recorderRef.current.getBlob());
+        });
+      });
+
+      if (!blob || blob.size === 0) {
+        throw new Error("Empty recording");
+      }
+
+      // Generate final filename
+      const finalFileName = `recording-${Date.now()}.webm`;
+      const finalFilePath = `recordings/${roomId}/${finalFileName}`;
+
+      // Upload final recording
+      const { error: uploadError } = await supabase.storage
+        .from("recordings")
+        .upload(finalFilePath, blob, {
+          cacheControl: "3600",
+          contentType: "video/webm",
+        });
+
+      if (uploadError) throw uploadError;
+
+      // Get public URL
+      const {
+        data: { publicUrl },
+      } = supabase.storage.from("recordings").getPublicUrl(finalFilePath);
+
+      // Calculate duration
+      const duration = Math.round(recordingState.duration);
+
+      // Update recording metadata
+      const { error: updateError } = await supabase
+        .from("recordings")
+        .update({
+          status: "completed",
+          file_name: finalFileName,
+          file_path: finalFilePath,
+          file_url: publicUrl,
+          duration: duration,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", recordingSessionIdRef.current);
+
+      if (updateError) throw updateError;
+
+      setShowRecordingAlert(true);
+      alert("✅ Recording saved and uploaded successfully!");
+
+      setRecordingAlertMessage("Recording saved successfully!");
+      setTimeout(() => setShowRecordingAlert(false), 3000);
+    } catch (err) {
+      console.error("Stop recording error:", err);
+      setShowRecordingAlert(true);
+      setRecordingAlertMessage(`Failed to save recording: ${err.message}`);
+      setTimeout(() => setShowRecordingAlert(false), 5000);
+    } finally {
+      setRecordingState({
+        isRecording: false,
+        duration: 0,
+        status: "idle",
+        recordingType: null,
+      });
+      cleanupRecording();
+    }
+  };
+
+  const getRecordingUrl = (filePath) => {
+    return supabase.storage.from("recordings").getPublicUrl(filePath).data
+      .publicUrl;
+  };
+
+  const fetchRoomRecordings = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("recordings")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { descending: true });
+
+      if (error) throw error;
+
+      // Add public URLs
+      return data.map((recording) => ({
+        ...recording,
+        url: getRecordingUrl(recording.file_path),
+      }));
+    } catch (error) {
+      console.error("Error fetching recordings:", error);
+      return [];
+    }
+  };
+
+  const deleteRecording = async (recordingId) => {
+    try {
+      // Get recording info first
+      const { data: recording, error: fetchError } = await supabase
+        .from("recordings")
+        .select("file_path")
+        .eq("id", recordingId)
+        .single();
+
+      if (fetchError) throw fetchError;
+
+      // Delete from storage
+      const { error: storageError } = await supabase.storage
+        .from("recordings")
+        .remove([recording.file_path]);
+
+      if (storageError) throw storageError;
+
+      // Delete from database
+      const { error: dbError } = await supabase
+        .from("recordings")
+        .delete()
+        .eq("id", recordingId);
+
+      if (dbError) throw dbError;
+
+      return true;
+    } catch (error) {
+      console.error("Error deleting recording:", error);
+      return false;
+    }
+  };
+
+  const cleanupRecording = () => {
+    if (recorderRef.current) {
+      try {
+        recorderRef.current.destroy();
+      } catch (e) {
+        console.error("Error destroying recorder:", e);
+      }
+      recorderRef.current = null;
+    }
+
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch (e) {
+          console.error("Error stopping track:", e);
+        }
+      });
+      screenStreamRef.current = null;
+    }
+
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  const leaveRoom = async () => {
+    if (!isMountedRef.current) return;
+
+    try {
+      if (isRecording) await stopRecording();
+
+      if (isScreenSharing && screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((track) => track.stop());
+        screenStreamRef.current = null;
+        setIsScreenSharing(false);
+      }
+
+      if (screenShareContainerRef.current) {
+        screenShareContainerRef.current.remove();
+        screenShareContainerRef.current = null;
+      }
+
+      if (peerRef.current?.id) {
+        await supabase
+          .from("signals")
+          .delete()
+          .eq("room_id", roomId)
+          .eq("peer_id", peerRef.current.id);
+      }
+
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+      }
+
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => track.stop());
+        localStreamRef.current = null;
+      }
+
+      Object.values(remoteVideosRef.current).forEach((el) => el.remove());
+      remoteVideosRef.current = {};
+
+      if (refreshInterval.current) {
+        clearInterval(refreshInterval.current);
+        refreshInterval.current = null;
+      }
+
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+
+      if (participantUpdateTimeoutRef.current) {
+        clearTimeout(participantUpdateTimeoutRef.current);
+        participantUpdateTimeoutRef.current = null;
+      }
+
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+
+      if (meetingDbId && user?.id) {
+        await supabase
+          .from("participants")
+          .delete()
+          .eq("meeting_id", meetingDbId)
+          .eq("user_id", user.id);
+      }
+
+      if (messagesChannel.current) {
+        supabase.removeChannel(messagesChannel.current);
+        messagesChannel.current = null;
+      }
+
+      if (reactionsChannel.current) {
+        supabase.removeChannel(reactionsChannel.current);
+        reactionsChannel.current = null;
+      }
+
+      if (participantsChannel.current) {
+        supabase.removeChannel(participantsChannel.current);
+        participantsChannel.current = null;
+      }
+
+      if (waitingChannel.current) {
+        supabase.removeChannel(waitingChannel.current);
+        waitingChannel.current = null;
+      }
+
+      setIsInitialized(false);
+      setPermitToJoin(false);
+      setWaitingForApproval(false);
+
+      navigate("/");
+    } catch (err) {
+      console.warn("Leave room error:", err);
+      navigate("/");
+    }
+  };
+
+  const refreshMeetingState = useCallback(async () => {
+    if (!isMountedRef.current || !meetingDbId || !user?.id) return;
+
+    try {
+      if (permitToJoin) {
+        await updateParticipants(meetingDbId);
+      }
+
+      if (isHost) {
+        await updateWaitingList(meetingDbId);
+      }
+
+      if (peerRef.current?.id) {
+        const { data: others } = await supabase
+          .from("signals")
+          .select("peer_id, user_id")
+          .eq("room_id", roomId)
+          .neq("peer_id", peerRef.current.id);
+
+        if (others?.length > 0) {
+          others.forEach(({ peer_id }) => {
+            if (
+              !peerConnectionsRef.current[peer_id] &&
+              !pendingPeerConnections.current.has(peer_id)
+            ) {
+              connectToPeer(peer_id);
+            }
+          });
+        }
+      }
+
+      if (peerRef.current) {
+        if (peerRef.current.disconnected) {
+          setConnectionStatus("Reconnecting...");
+          peerRef.current.reconnect();
+        } else if (peerRef.current.open) {
+          setConnectionStatus("Connected");
+        }
+      }
+    } catch (error) {
+      console.error("Auto-refresh error:", error);
+    }
+  }, [meetingDbId, user?.id, permitToJoin, isHost, roomId]);
+
+  const [approvalCheckCount, setApprovalCheckCount] = useState(0);
+
   const handleScroll = useCallback((e) => {
     const element = e.target;
     const atBottom =
       element.scrollHeight - element.scrollTop <= element.clientHeight + 50; // 50px buffer
     setIsAtBottom(atBottom);
   }, []);
+
+  const handleRecordClick = () => {
+    if (recordingState.isRecording) {
+      stopRecording();
+    } else {
+      setShowRecordingOptions(!showRecordingOptions);
+    }
+  };
 
   const initRoom = useCallback(async () => {
     if (isInitialized || !isMountedRef.current) return;
@@ -1922,6 +1929,7 @@ const stopRecording = async () => {
     setupWaitingListener,
   ]);
 
+  // Effects
   useEffect(() => {
     const pass = new URLSearchParams(search).get("passcode") || "";
     setInputPasscode(pass);
@@ -2021,36 +2029,50 @@ const stopRecording = async () => {
     return () => clearInterval(interval);
   }, [setupRealTimeMessages, setupRealTimeReactions]);
 
- 
   useEffect(() => {
-  setIsAtBottom(false);
-}, []);
+    setIsAtBottom(false);
+  }, []);
 
+  useEffect(() => {
+    if (messages.length > 0) {
+      setHasNewMessages(true);
+    }
+  }, [messages]);
 
-  if (needPasscode) {
-    return (
-      <div className="p-4 max-w-md mx-auto">
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <h2 className="text-xl font-bold mb-4">🔐 Enter Meeting Passcode</h2>
-          <input
-            type="password"
-            className="border border-gray-300 p-3 w-full rounded-lg mb-4"
-            placeholder="Enter passcode"
-            value={inputPasscode}
-            onChange={(e) => setInputPasscode(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && setNeedPasscode(false)}
-          />
-          <button
-            onClick={() => setNeedPasscode(false)}
-            className="w-full p-3 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600"
-          >
-            Join Meeting
-          </button>
-        </div>
-      </div>
-    );
-  }
+  useEffect(() => {
+    if (hasNewMessages && isAtBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      setHasNewMessages(false);
+    }
+  }, [messages, hasNewMessages, isAtBottom]);
 
+  useEffect(() => {
+    const checkIfMobile = () => {
+      setIsMobile(
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+          navigator.userAgent
+        )
+      );
+    };
+    checkIfMobile();
+  }, []);
+
+  useEffect(() => {
+    if (permitToJoin && !autoRefreshIntervalRef.current) {
+      autoRefreshIntervalRef.current = setInterval(() => {
+        refreshMeetingState();
+      }, AUTO_REFRESH_INTERVAL);
+    }
+
+    return () => {
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+    };
+  }, [permitToJoin, refreshMeetingState]);
+
+  // Component rendering
   return (
     <div className="p-4 space-y-4 max-w-6xl mx-auto relative">
       {showRecordingAlert && (
@@ -2058,7 +2080,6 @@ const stopRecording = async () => {
           {recordingAlertMessage}
         </div>
       )}
-
       <div className="bg-white rounded-lg shadow-sm border p-4">
         <h1 className="text-2xl font-bold mb-4">📹 Meeting Room: {roomId}</h1>
         <div className="flex gap-2">
@@ -2149,18 +2170,87 @@ const stopRecording = async () => {
               </button>
             )}
             {isHost && (
-              <button
-                onClick={isRecording ? stopRecording : startRecording}
-                className={`p-3 rounded-full flex items-center gap-2 ${
-                  isRecording ? "bg-red-500 text-white" : "bg-gray-300"
-                } hover:bg-gray-400`}
-                title={isRecording ? "Stop recording" : "Start recording"}
-              >
-                {isRecording ? "⏹️" : "🔴"}
-                <span className="text-sm hidden sm:inline">
-                  {isRecording ? "Stop Recording" : "Record"}
-                </span>
-              </button>
+              <div className="relative">
+                <button
+                  onClick={handleRecordClick}
+                  className={`p-3 rounded-full flex items-center gap-2 ${
+                    recordingState.isRecording
+                      ? "bg-red-500 text-white animate-pulse"
+                      : "bg-gray-300 hover:bg-gray-400"
+                  }`}
+                  disabled={
+                    recordingState.status === "starting" ||
+                    recordingState.status === "stopping"
+                  }
+                >
+                  {recordingState.isRecording ? "⏹️" : "🔴"}
+                  <span className="text-sm hidden sm:inline">
+                    {recordingState.isRecording
+                      ? `Recording ${formatTime(recordingState.duration)}`
+                      : "Record"}
+                  </span>
+                  {(recordingState.status === "starting" ||
+                    recordingState.status === "stopping") && (
+                    <span className="ml-2">
+                      <svg
+                        className="animate-spin h-4 w-4 text-white"
+                        xmlns="http://www.w3.org/2000/svg"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                      >
+                        <circle
+                          className="opacity-25"
+                          cx="12"
+                          cy="12"
+                          r="10"
+                          stroke="currentColor"
+                          strokeWidth="4"
+                        ></circle>
+                        <path
+                          className="opacity-75"
+                          fill="currentColor"
+                          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                        ></path>
+                      </svg>
+                    </span>
+                  )}
+                </button>
+
+                {showRecordingOptions && !recordingState.isRecording && (
+                  <div className="absolute bottom-full mb-2 left-0 bg-white shadow-lg rounded-lg p-2 z-10 w-48">
+                    <div className="text-xs font-semibold mb-1 text-gray-500">
+                      RECORD
+                    </div>
+                    <button
+                      onClick={() => {
+                        startRecording("screen");
+                        setShowRecordingOptions(false);
+                      }}
+                      className="block w-full text-left px-3 py-2 hover:bg-gray-100 rounded"
+                    >
+                      Screen Only
+                    </button>
+                    <button
+                      onClick={() => {
+                        startRecording("camera");
+                        setShowRecordingOptions(false);
+                      }}
+                      className="block w-full text-left px-3 py-2 hover:bg-gray-100 rounded"
+                    >
+                      Camera Only
+                    </button>
+                    <button
+                      onClick={() => {
+                        startRecording("both");
+                        setShowRecordingOptions(false);
+                      }}
+                      className="block w-full text-left px-3 py-2 hover:bg-gray-100 rounded"
+                    >
+                      Screen + Camera
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
             <button
               onClick={() => {
@@ -2199,6 +2289,28 @@ const stopRecording = async () => {
             )}
           </div>
         </div>
+
+        {recordingState.isRecording && (
+          <div className="fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded-lg flex items-center gap-3 z-50">
+            <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
+            <div>
+              Recording {formatTime(recordingState.duration)} -{" "}
+              {
+                {
+                  screen: "Screen",
+                  camera: "Camera",
+                  both: "Screen + Camera",
+                }[recordingState.recordingType]
+              }
+            </div>
+            <button
+              onClick={stopRecording}
+              className="ml-2 bg-white text-red-600 px-2 py-1 rounded text-sm font-bold"
+            >
+              Stop
+            </button>
+          </div>
+        )}
 
         <div className="space-y-4">
           {permitToJoin && (
@@ -2329,8 +2441,9 @@ const stopRecording = async () => {
               showChat ? "block" : "hidden"
             }`}
           >
-            <div className="p-3 border-b flex justify-between items-center"
-             {...(!isAtBottom && (
+            <div
+              className="p-3 border-b flex justify-between items-center"
+              {...(!isAtBottom && (
                 <button
                   onClick={() => {
                     setIsAtBottom(true);
@@ -2343,7 +2456,8 @@ const stopRecording = async () => {
                 >
                   ↓ New Messages
                 </button>
-              ))}>
+              ))}
+            >
               <h3 className="font-bold">💬 Chat</h3>
               <button
                 onClick={() => setShowChat(false)}
@@ -2353,8 +2467,7 @@ const stopRecording = async () => {
               </button>
             </div>
 
-            <div
-              className="p-3 h-60 overflow-y-auto space-y-2">
+            <div className="p-3 h-60 overflow-y-auto space-y-2">
               {messages.map((message) => (
                 <div
                   key={message.id}
